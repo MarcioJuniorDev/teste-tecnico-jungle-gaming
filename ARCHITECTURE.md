@@ -70,3 +70,32 @@ Não implementada.
 - `AuthGuard` no-op.
 - `ProviderIdentityPort` isola a extensão.
 - Desenho futuro: Keycloak via OIDC.
+
+# Domínio
+
+## Money
+- Imutável, `Decimal` interno, escala fixa 2.
+- `from` rejeita mais de 2 casas (não arredonda).
+- `isPositive()` exclui zero (corrige comportamento do `Decimal`).
+- Operações entre moedas diferentes lançam `InvalidMoneyError`.
+- Serialização sempre em string decimal ("25.00"), nunca `number`.
+
+## Wallet
+- Agregado: `debit`/`credit` retornam `{ entry, wallet }` — movimentação e ledger atômicos no domínio.
+- A wallet original não é mutada (nova instância, `version` + 1).
+- Saldo nunca negativo (checagem no domínio + `CHECK` no banco, na Fase 3).
+- `rehydrate` não revalida transições.
+
+## WagerTransaction
+- `OPENING` é interno: `create` o rejeita; `createOpening` é a factory interna.
+- `REFUND`/`ROLLBACK` exigem `referenceExternalTransactionId` no `create`.
+- Terminais (`PROCESSED`/`REJECTED`/`FAILED`) lançam `InvalidTransactionStateError` em qualquer transição.
+- `ledgerDirectionFor` deriva a direção do `kind`; `ROLLBACK` inverte a direção da referência.
+- `matchesPayload` compara o `payloadHash` para distinguir replay de conflito.
+
+# Limitações atuais (Fase 2)
+- `Wallet`, `WalletLedgerEntry` e `WagerTransaction` são domínio puro — ainda não mapeados no MikroORM.
+- Sem `InboxMessage`, `OutboxMessage`, eventos de integração, `WagerPolicy`.
+- Sem endpoints HTTP, consumer SQS, outbox publisher, observabilidade.
+- Sem `Dockerfile` da app; o Compose sobe só PG e LocalStack.
+- Auth não implementada (decisão registrada acima).

@@ -69,6 +69,32 @@ ORM para PostgreSQL, com suporte a migrations.
 - `prom-client` — métricas Prometheus
 - `zod` — validação de schemas
 
+## Testes
+
+Testes unitários de domínio (Money, WalletLedgerEntry, Wallet, WagerTransaction) em `test/unit/`:
+
+```powershell
+bun test
+```
+
+## Estrutura
+
+```text
+src/
+├── domain/            # domínio puro (sem Nest/ORM)
+│   ├── money/
+│   ├── ledger/
+│   ├── wallet/
+│   └── wagering/
+├── infrastructure/    # MikroORM, SQS, outbox (em construção)
+├── application/       # use cases, ports (a implementar)
+├── interfaces/        # HTTP, SQS consumer, health (a implementar)
+├── app.module.ts
+└── main.ts
+test/unit/             # testes de domínio
+migrations/            # migrations (vazia até a Fase 3)
+```
+
 ## Documentação adicional
 
 - `ARCHITECTURE.md` — decisões arquiteturais
