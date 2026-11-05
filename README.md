@@ -27,3 +27,8 @@ Runtime, package manager, test runnet e bundler de JavaScript e TypeScript (como
 ## Bibliotecas Complementares
 - ```bun add decimal.js @aws-sdk/client-sqs pino nestjs-pino prom-client zod```.
 - ```bun add -d typescript @types/bun```: dependências de desenvolvimento.
+
+# Testando
+
+- ```bun run typecheck```: executa o script "typecheck", procurando erros de tipagem sem iniciar a aplicação.
+- ```bun run dev```: inicia a aplicação em http://localhost:3000. (como npx expo start)
