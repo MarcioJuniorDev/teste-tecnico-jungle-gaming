@@ -1,9 +1,9 @@
 import { Module } from '@nestjs/common';
 import { AppController } from './app.controller';
+import { PersistenceModule } from './infrastructure/persistence/mikro-orm.module';
 
 @Module({
-  imports: [],
+  imports: [PersistenceModule],
   controllers: [AppController],
-  providers: [],
 })
 export class AppModule {}

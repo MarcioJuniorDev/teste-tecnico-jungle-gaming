@@ -33,6 +33,7 @@
   "devDependencies": {
     "@mikro-orm/cli": "^7.2.7",
     "@types/bun": "^1.4.4",
+    "tsx": "^4.23.15",
     "typescript": "5.9.3"
   }
 }

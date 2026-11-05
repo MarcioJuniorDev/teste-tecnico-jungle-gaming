@@ -1,34 +1,74 @@
-# Dependências
+# Distributed Wagering Processor
 
-bun add @nestjs/common @nestjs/core @nestjs/platform-express reflect-metadata rxjsbun add @mikro-orm/core @mikro-orm/nestjs @mikro-orm/postgresql @mikro-orm/migrations
+Serviço NestJS para processamento distribuído de apostas, com PostgreSQL, MikroORM, LocalStack e SQS.
+
+## Pré-requisitos
+
+- [Bun](https://bun.sh) 1.4+
+- Docker Desktop + Docker Compose
+- PowerShell (Windows) ou shell equivalente
+
+## Instalação do Bun
+
+```powershell
+powershell -c "irm bun.sh/install.ps1 | iex"
+bun --version
+```
+
+## Dependências
+
+```powershell
+bun add @nestjs/common @nestjs/core @nestjs/platform-express reflect-metadata rxjs
 bun add @mikro-orm/core @mikro-orm/nestjs @mikro-orm/postgresql @mikro-orm/migrations
 bun add decimal.js @aws-sdk/client-sqs pino nestjs-pino prom-client zod
 bun add -d typescript @types/bun @mikro-orm/cli
+```
 
-# Stack
+## Infraestrutura (Docker)
 
-## Bun
+Sobe PostgreSQL (porta 5432) e LocalStack (porta 4566) com healthchecks e volumes persistentes:
 
-Runtime, package manager, test runnet e bundler de JavaScript e TypeScript (como Node.js)
+```powershell
+docker compose up -d
+docker compose ps
+```
 
-- ```powershell -c "irm bun.sh/install.ps1 | iex"```: instala bun.
-- ```bun --version```:versão do bun.
-- ```bun init -y```: inicializa o projeto (cria package.json).
+O script `infra/localstack-init.sh` cria as filas `wager-transactions.fifo`, `wager-transactions-dlq.fifo` e `wager-events`, com redrive da fila principal para a DLQ após 5 tentativas.
 
-## NestJS
+## Scripts
 
-- ```bun add @nestjs/common @nestjs/core @nestjs/platform-express reflect-metadata rxjs```: instalação.
+- `bun run dev` — inicia a aplicação em http://localhost:3000
+- `bun run start` — inicia a aplicação (modo produção)
+- `bun run typecheck` — verifica erros de tipagem sem executar
+- `bun run test` — testes unitários
+- `bun run test:integration` — testes de integração
+- `bun run test:concurrency` — testes de concorrência
+- `bun run migration:create` — cria migration
+- `bun run migration:up` — aplica migrations
+- `bun run migration:down` — reverte migrations
 
-## MikroORM
+## Stack
 
-- ```bun add @mikro-orm/core @mikro-orm/nestjs @mikro-orm/postgresql @mikro-orm/migrations```: instalação.
-- ```bun add -d @mikro-orm/cli```: instalação CLI.
+### Bun
 
-## Bibliotecas Complementares
-- ```bun add decimal.js @aws-sdk/client-sqs pino nestjs-pino prom-client zod```.
-- ```bun add -d typescript @types/bun```: dependências de desenvolvimento.
+Runtime, package manager, test runner e bundler de JavaScript/TypeScript.
 
-# Testando
+### NestJS
 
-- ```bun run typecheck```: executa o script "typecheck", procurando erros de tipagem sem iniciar a aplicação.
-- ```bun run dev```: inicia a aplicação em http://localhost:3000. (como npx expo start)
+Framework HTTP da aplicação.
+
+### MikroORM
+
+ORM para PostgreSQL, com suporte a migrations.
+
+### Bibliotecas complementares
+
+- `decimal.js` — aritmética decimal
+- `@aws-sdk/client-sqs` — cliente SQS
+- `pino` / `nestjs-pino` — logging
+- `prom-client` — métricas Prometheus
+- `zod` — validação de schemas
+
+## Documentação adicional
+
+- `ARCHITECTURE.md` — decisões arquiteturais
