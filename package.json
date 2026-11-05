@@ -1,4 +1,18 @@
 {
+  "name": "distributed-wagering-processor",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "bun src/main.ts",
+    "dev": "bun --watch src/main.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "test:integration": "bun test test/integration",
+    "test:concurrency": "bun test test/concurrency",
+    "migration:create": "mikro-orm migration:create",
+    "migration:up": "mikro-orm migration:up",
+    "migration:down": "mikro-orm migration:down"
+  },
   "dependencies": {
     "@aws-sdk/client-sqs": "^3.1162.0",
     "@mikro-orm/core": "^7.2.7",
