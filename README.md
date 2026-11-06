@@ -22,6 +22,7 @@ bun add @nestjs/common @nestjs/core @nestjs/platform-express reflect-metadata rx
 bun add @mikro-orm/core @mikro-orm/nestjs @mikro-orm/postgresql @mikro-orm/migrations
 bun add decimal.js @aws-sdk/client-sqs pino nestjs-pino prom-client zod
 bun add -d typescript @types/bun @mikro-orm/cli
+bun add -d @types/express
 ```
 
 ## Infraestrutura (Docker)
@@ -68,6 +69,40 @@ O `MikroOrmModule.forRoot(config)` inicializa o ORM no boot; o `entities` aponta
 
 O `payloadHash` é SHA-256 do JSON canônico de `{ providerId, externalTransactionId, playerId, walletId, roundId, gameId, kind, money }`.
 
+## Endpoints
+
+### Escrita (implementados)
+
+- `POST /wallets` — cria wallet; saldo inicial > 0 gera `OPENING` + ledger `CREDIT` + outbox, na mesma transação. `201` no sucesso, `409` se `(playerId, currency)` já existe.
+- `POST /wagering/transactions` — submete transação de aposta. Header `Idempotency-Key` obrigatório (`422` se ausente). Chama `ProcessWagerTransactionUseCase`.
+  - `201` processado (primeira vez), com `{ transactionId, status, balance, idempotentReplay: false }`.
+  - `200` replay (mesma key, mesmo payload), com `idempotentReplay: true`.
+  - `202` `PENDING_REFERENCE`.
+  - `422` rejeição de negócio, com `failureCode`.
+  - `409` conflito de idempotência (mesma key, payload diferente).
+  - `400` payload inválido (validação zod).
+
+### Leitura (a implementar — Fase 6b)
+
+- `GET /wallets/:id`
+- `GET /wallets/:id/ledger?cursor=...&limit=50`
+- `GET /wagering/transactions/:id`
+- `GET /providers/:providerId/wagering/transactions/:externalTransactionId`
+- `POST /wallets/:id/reconciliation`
+- `GET /health/live`, `GET /health/ready`
+
+### Mapeamento HTTP
+
+| Código | Situação |
+|---|---|
+| 400 | Payload inválido (`VALIDATION_FAILED`) |
+| 409 | Conflito de idempotência (`IDEMPOTENCY_CONFLICT`) ou wallet duplicada (`WALLET_ALREADY_EXISTS`) |
+| 201 | Processado, primeira vez |
+| 200 | Replay |
+| 202 | Pendente (`PENDING_REFERENCE`) |
+| 422 | Rejeição de negócio (`BUSINESS_REJECTION` com `failureCode`) |
+| 503 | Falha transitória (a implementar no health `ready`) |
+
 ## Scripts
 
 - `bun run dev` — inicia a aplicação em http://localhost:3000
@@ -110,7 +145,7 @@ Testes unitários de domínio (Money, WalletLedgerEntry, Wallet, WagerTransactio
 bun test
 ```
 
-Esperado: **63 testes** (55 unitários + 8 do use case + 1 integração), 0 falhas.
+Esperado: 63 testes (62 unitários + 1 integração), 0 falhas.
 
 ## Estrutura
 
@@ -125,6 +160,11 @@ src/
 │   │   ├── ledger.repository.ts
 │   │   └── unit-of-work.ts
 │   └── use-cases/
+│       ├── create-wallet/
+│       │   ├── create-wallet.command.ts
+│       │   ├── create-wallet.result.ts
+│       │   ├── create-wallet.errors.ts
+│       │   └── create-wallet.use-case.ts
 │       └── process-wager-transaction/
 │           ├── process-wager-transaction.command.ts
 │           ├── process-wager-transaction.result.ts
@@ -133,88 +173,44 @@ src/
 │           └── payload-hash.ts
 ├── domain/                             # domínio puro (sem Nest/ORM)
 │   ├── money/
-│   │   └── money.ts
 │   ├── ledger/
-│   │   ├── ledger-direction.ts
-│   │   └── wallet-ledger-entry.ts
 │   ├── wallet/
-│   │   ├── wallet.ts
-│   │   └── wallet-state.ts
 │   ├── wagering/
-│   │   ├── failure-code.ts
-│   │   ├── wager-policy.ts
-│   │   ├── wager-transaction.ts
-│   │   ├── wager-transaction-kind.ts
-│   │   ├── wager-transaction-status.ts
-│   │   ├── wager-transaction-state.ts
-│   │   ├── event-context.ts
 │   │   └── events/
-│   │       ├── wallet-balance-changed.ts
-│   │       ├── wager-transaction-pending-reference.ts
-│   │       ├── wager-transaction-processed.ts
-│   │       └── wager-transaction-rejected.ts
 │   ├── messaging/
-│   │   ├── inbox-message.ts
-│   │   ├── inbox-message-state.ts
-│   │   ├── outbox-message.ts
-│   │   ├── outbox-message-state.ts
-│   │   └── integration-event.ts
 │   └── shared/
-│       ├── domain-error.ts
-│       ├── invalid-money-error.ts
-│       └── invalid-transaction-state-error.ts
 ├── infra/
 │   └── persistence/
-│       ├── entities/                   # entidades MikroORM (separadas do domínio)
-│       │   ├── money.embeddable.ts
-│       │   ├── wallet.entity.ts
-│       │   ├── wallet-ledger-entry.entity.ts
-│       │   ├── wager-transaction.entity.ts
-│       │   ├── inbox-message.entity.ts
-│       │   └── outbox-message.entity.ts
-│       ├── mappers/                    # domínio ↔ ORM
-│       │   ├── wallet.mapper.ts
-│       │   ├── wallet-ledger-entry.mapper.ts
-│       │   ├── wager-transaction.mapper.ts
-│       │   ├── inbox-message.mapper.ts
-│       │   └── outbox-message.mapper.ts
-│       ├── repositories/               # implementações MikroORM das portas
-│       │   ├── wallet.repository.ts
-│       │   ├── wager-transaction.repository.ts
-│       │   ├── inbox.repository.ts
-│       │   ├── outbox.repository.ts
-│       │   ├── ledger.repository.ts
-│       │   └── unit-of-work.ts
+│       ├── entities/
+│       ├── mappers/
+│       ├── repositories/
 │       └── persistence.module.ts
-├── interfaces/                         # HTTP, SQS consumer, health (a implementar)
+├── interfaces/
 │   └── http/
+│       ├── controllers/
+│       │   ├── wallet.controller.ts
+│       │   └── wager-transaction.controller.ts
+│       ├── dtos/
+│       │   ├── create-wallet.dto.ts
+│       │   └── submit-wager-transaction.dto.ts
+│       ├── pipes/
+│       │   └── zod-validation.pipe.ts
+│       ├── filters/
+│       │   └── domain-exception.filter.ts
+│       └── http.module.ts
 ├── app.controller.ts
 ├── app.module.ts
 └── main.ts
-
 test/
 ├── unit/
-│   ├── money.test.ts
-│   ├── wallet.test.ts
-│   ├── wallet-ledger-entry.test.ts
-│   ├── wager-transaction.test.ts
-│   ├── wager-policy.test.ts
-│   ├── inbox-message.test.ts
-│   ├── outbox-message.test.ts
-│   └── process-wager-transaction.test.ts
-├── integration/
-│   └── repositories.test.ts
-└── concurrency/                        # (a implementar)
-
+└── integration/
 migrations/
 ├── Migration20261106013011.ts
 ├── Migration20261106020000_add_invariants.ts
 └── sql/
     └── forbid_ledger_mutation.sql
-
 infra/
-└── localstack-init.sh                  # cria as filas SQS
-
+└── localstack-init.sh
 mikro-orm.config.ts
 docker-compose.yml
 package.json

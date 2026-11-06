@@ -130,6 +130,23 @@ Não implementada.
 - Fork por request automático (`@mikro-orm/nestjs`); `fork()` explícito só em workers de background (Fase 8).
 - `entities` do runtime aponta para `src/` (Bun transpila TS direto); `dist/` fica para containerização (Fase 10).
 - Tokens `Symbol` porque interfaces somem no runtime; o NestJS precisa de um valor de injeção.
+- `save` dos repositórios faz `findOne` + `assign`/`persist`: insert se não existe, update se existe. Resolve o `persist` de entidade nova em update (que violava a PK). Custo: um `SELECT` extra por save; otimização na Fase 10.
+
+# API HTTP
+- Controllers em `src/interfaces/http/controllers/`, finos: validam com zod, chamam o use case, mapeiam o resultado para HTTP.
+- `ZodValidationPipe` valida o body contra o schema; falha → `400` com `VALIDATION_FAILED` e a lista de issues.
+- `DomainExceptionFilter` (global) mapeia:
+  - `IdempotencyConflictError` → `409` `IDEMPOTENCY_CONFLICT`.
+  - `WalletAlreadyExistsError` → `409` `WALLET_ALREADY_EXISTS`.
+  - `InvalidMoneyError` → `400` `INVALID_MONEY`.
+  - `InvalidTransactionStateError` → `409` `INVALID_TRANSACTION_STATE`.
+  - `DomainError` → `400` `DOMAIN_ERROR`.
+- Rejeição de negócio (`REJECTED`) **não** é exceção: o controller lê `result.status` e devolve `422` com `failureCode`.
+- `PENDING_REFERENCE` → `202`. Processado primeira vez → `201`. Replay → `200`.
+- Header `Idempotency-Key` obrigatório; ausente → `422` `MISSING_IDEMPOTENCY_KEY`.
+- `POST /wallets` usa `CreateWalletUseCase`: wallet nasce com zero, `OPENING` credita o saldo inicial, ledger `CREDIT` e outbox na mesma transação; duplicado → `409`.
+- Endpoints de leitura (Fase 6b) usam as portas direto no controller, sem use case (leitura sem regra de negócio).
+- Auth não implementada (decisão da Fase 0); `AuthGuard` no-op + `ProviderIdentityPort` a implementar.
 
 # Schema (banco)
 Garantias aplicadas no schema, não só em código:
@@ -157,14 +174,17 @@ Uma transação SQL por operação, na ordem:
 7. Outbox — eventos enfileirados na mesma transação (`WagerTransactionProcessed`, `WagerTransactionRejected`, `WalletBalanceChanged`, `WagerTransactionPendingReference`).
 8. Commit.
 
+- Cada evento da outbox tem `eventId` único (`randomUUID()` por evento); `correlationId`, `causationId` e `occurredAt` são compartilhados. Sem isso, dois eventos no mesmo `ctx` violam a PK da outbox.
+
 Regra: rejeição de negócio **não** derruba a transação (auditável); só erro de infraestrutura faz rollback.
 
 `payloadHash` = SHA-256 do JSON canônico (chaves ordenadas) de `{ providerId, externalTransactionId, playerId, walletId, roundId, gameId, kind, money }`; header/metadados fora.
 
-# Limitações atuais (pós-Fase 5)
-- Sem endpoints HTTP — Fase 6.
-- Sem consumer SQS, outbox publisher, observabilidade — Fases 7–9.
-- Sem testes de concorrência reais (corrida de `UNIQUE`, lock) — Fase 10.
-- O teste de integração de repositórios roda contra o banco de dev; setup dedicado na Fase 10.
+# Limitações atuais (pós-Fase 6a)
+- Endpoints de leitura (wallet, ledger, transações, reconciliação) e health checks: Fase 6b.
+- Sem consumer SQS, outbox publisher, worker de `PENDING_REFERENCE`, observabilidade: Fases 7–9.
+- Sem testes de concorrência reais (corrida de `UNIQUE`, lock, 3 instâncias): Fase 10.
+- O teste de integração de repositórios roda contra o banco de dev; setup dedicado (banco limpo + migrations) na Fase 10.
+- `save` dos repositórios faz `findOne` + `assign`/`persist` (um `SELECT` extra por save). Otimização na Fase 10.
 - Sem `Dockerfile` da app.
 - Auth não implementada (decisão registrada acima).

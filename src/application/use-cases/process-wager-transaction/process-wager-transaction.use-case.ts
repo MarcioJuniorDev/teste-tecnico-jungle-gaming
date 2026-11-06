@@ -53,7 +53,7 @@ export class ProcessWagerTransactionUseCase {
     @Inject(INBOX_REPOSITORY) private readonly inbox: InboxRepository,
     @Inject(OUTBOX_REPOSITORY) private readonly outbox: OutboxRepository,
     @Inject(LEDGER_REPOSITORY) private readonly ledger: LedgerRepository,
-  ) {}
+  ) { }
 
   async execute(
     command: ProcessWagerTransactionCommand,
@@ -149,24 +149,24 @@ export class ProcessWagerTransactionUseCase {
 
     const reference = tx.requiresReference()
       ? await this.transactions.findByProviderAndExternalId(
-          command.providerId,
-          tx.referenceExternalTransactionId!,
-        )
+        command.providerId,
+        tx.referenceExternalTransactionId!,
+      )
       : null;
 
     const existingReversals = reference
       ? {
-          refund:
-            (await this.transactions.findProcessedReversalFor(
-              reference.id,
-              WagerTransactionKind.Refund,
-            )) !== null,
-          rollback:
-            (await this.transactions.findProcessedReversalFor(
-              reference.id,
-              WagerTransactionKind.Rollback,
-            )) !== null,
-        }
+        refund:
+          (await this.transactions.findProcessedReversalFor(
+            reference.id,
+            WagerTransactionKind.Refund,
+          )) !== null,
+        rollback:
+          (await this.transactions.findProcessedReversalFor(
+            reference.id,
+            WagerTransactionKind.Rollback,
+          )) !== null,
+      }
       : { refund: false, rollback: false };
 
     const decision = WagerPolicy.evaluate({
@@ -278,13 +278,22 @@ export class ProcessWagerTransactionUseCase {
     tx.markProcessed(reference?.id, new Date());
     await this.transactions.save(tx);
 
-    const ctx = this.context(tx.id, command);
+    const baseCtx = {
+      correlationId: command.correlationId,
+      causationId: tx.id,
+      occurredAt: new Date(),
+    };
     await this.enqueue(
-      OutboxMessage.enqueue(WagerTransactionProcessed.from(tx, ctx)),
+      OutboxMessage.enqueue(
+        WagerTransactionProcessed.from(tx, { ...baseCtx, eventId: randomUUID() }),
+      ),
     );
     await this.enqueue(
       OutboxMessage.enqueue(
-        WalletBalanceChanged.from(movement.wallet, movement.entry, ctx),
+        WalletBalanceChanged.from(movement.wallet, movement.entry, {
+          ...baseCtx,
+          eventId: randomUUID(),
+        }),
       ),
     );
 

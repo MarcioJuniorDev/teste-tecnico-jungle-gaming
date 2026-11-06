@@ -976,18 +976,7 @@
           "columnName": "money_amount"
         }
       ],
-      "triggers": [
-        {
-          "name": "wallet_ledger_entries_immutable",
-          "timing": "before",
-          "events": [
-            "delete",
-            "update"
-          ],
-          "forEach": "row",
-          "body": ""
-        }
-      ],
+      "triggers": [],
       "foreignKeys": {
         "wle_wallet_fk": {
           "columnNames": [

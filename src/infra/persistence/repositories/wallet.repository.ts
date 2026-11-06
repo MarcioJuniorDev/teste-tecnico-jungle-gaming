@@ -7,7 +7,7 @@ import { WalletMapper } from '../mappers/wallet.mapper';
 
 @Injectable()
 export class MikroOrmWalletRepository implements WalletRepository {
-  constructor(private readonly em: EntityManager) {}
+  constructor(private readonly em: EntityManager) { }
 
   async findById(id: string): Promise<Wallet | null> {
     const entity = await this.em.findOne(WalletEntity, { id });
@@ -25,7 +25,12 @@ export class MikroOrmWalletRepository implements WalletRepository {
 
   async save(wallet: Wallet): Promise<void> {
     const entity = WalletMapper.toEntity(wallet);
-    this.em.persist(entity);
+    const managed = await this.em.findOne(WalletEntity, { id: wallet.id });
+    if (managed) {
+      this.em.assign(managed, entity, { mergeObjectProperties: true });
+    } else {
+      this.em.persist(entity);
+    }
     await this.em.flush();
   }
 }

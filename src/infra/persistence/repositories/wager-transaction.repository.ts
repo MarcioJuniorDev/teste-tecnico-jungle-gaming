@@ -52,7 +52,12 @@ export class MikroOrmWagerTransactionRepository implements WagerTransactionRepos
 
   async save(transaction: WagerTransaction): Promise<void> {
     const entity = WagerTransactionMapper.toEntity(transaction);
-    this.em.persist(entity);
+    const managed = await this.em.findOne(WagerTransactionEntity, { id: transaction.id });
+    if (managed) {
+      this.em.assign(managed, entity, { mergeObjectProperties: true });
+    } else {
+      this.em.persist(entity);
+    }
     await this.em.flush();
   }
 }

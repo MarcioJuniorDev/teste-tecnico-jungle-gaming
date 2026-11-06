@@ -26,7 +26,12 @@ export class MikroOrmOutboxRepository implements OutboxRepository {
 
   async save(message: OutboxMessage): Promise<void> {
     const entity = OutboxMessageMapper.toEntity(message);
-    this.em.persist(entity);
+    const managed = await this.em.findOne(OutboxMessageEntity, { id: message.id });
+    if (managed) {
+      this.em.assign(managed, entity, { mergeObjectProperties: true });
+    } else {
+      this.em.persist(entity);
+    }
     await this.em.flush();
   }
 }

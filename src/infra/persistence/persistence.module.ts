@@ -27,11 +27,9 @@ const REPOSITORY_PROVIDERS = [
   { provide: LEDGER_REPOSITORY, useClass: MikroOrmLedgerRepository },
 ];
 
-const USE_CASE_PROVIDERS = [ProcessWagerTransactionUseCase];
-
 @Module({
   imports: [MikroOrmModule.forRoot(config)],
-  providers: [...REPOSITORY_PROVIDERS, ...USE_CASE_PROVIDERS],
-  exports: [...REPOSITORY_PROVIDERS, ...USE_CASE_PROVIDERS],
+  providers: REPOSITORY_PROVIDERS,
+  exports: REPOSITORY_PROVIDERS,
 })
-export class PersistenceModule {}
+export class PersistenceModule { }
