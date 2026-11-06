@@ -8,7 +8,7 @@ const config = defineConfig({
   user: process.env.DB_USER ?? 'wagering',
   password: process.env.DB_PASSWORD ?? 'wagering_dev',
   entities: ['./dist/**/*.entity.js'],
-  entitiesTs: ['./src/**/*.entity.ts'],
+  entitiesTs: ['./src/infra/persistence/entities/**/*.entity.ts'],
   migrations: {
     path: './dist/migrations',
     pathTs: './migrations',

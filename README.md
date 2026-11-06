@@ -35,6 +35,19 @@ docker compose ps
 
 O script `infra/localstack-init.sh` cria as filas `wager-transactions.fifo`, `wager-transactions-dlq.fifo` e `wager-events`, com redrive da fila principal para a DLQ após 5 tentativas.
 
+## Banco de Dados
+
+### Migrations
+- bun run migration:create   # gera nova migration a partir do diff das entidades
+- bun run migration:up       # aplica migrations pendentes
+- bun run migration:down     # reverte a última migration
+
+A migration inicial (20261106013011) cria as tabelas; a migration 20261106020000_add_invariants adiciona as constraints (CHECK, FOREIGN KEY, índice único parcial de reversão).
+
+#### Trigger de imutabilidade do ledger
+O trigger wallet_ledger_entries_immutable e a função forbid_ledger_mutation() são aplicados fora das migrations, via psql, porque o runner do MikroORM v7 separa statements por ; e quebra blocos PL/pgSQL delimitados por $$. O SQL versionado está em migrations/sql/forbid_ledger_mutation.sql:
+```Get-Content .\migrations\sql\forbid_ledger_mutation.sql | docker compose exec -T postgres psql -U wagering -d wagering```
+
 ## Scripts
 
 - `bun run dev` — inicia a aplicação em http://localhost:3000

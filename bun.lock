@@ -6,6 +6,7 @@
       "dependencies": {
         "@aws-sdk/client-sqs": "^3.1162.0",
         "@mikro-orm/core": "^7.2.7",
+        "@mikro-orm/decorators": "^7.2.7",
         "@mikro-orm/migrations": "^7.2.7",
         "@mikro-orm/nestjs": "^7.1.0",
         "@mikro-orm/postgresql": "^7.2.7",
@@ -122,6 +123,8 @@
     "@mikro-orm/cli": ["@mikro-orm/cli@7.2.7", "", { "dependencies": { "@mikro-orm/core": "7.2.7", "mikro-orm": "7.2.7", "yargs": "18.2.0" }, "bin": { "mikro-orm": "cli.js" } }, "sha512-sr7aycBKIZcx1OL6H0JZsm+/lAatOAsFkJvac7h2vEiCjcyqtmps+5Q91Xyl80Rh9SWd1sL8kcHaww24nCNHcw=="],
 
     "@mikro-orm/core": ["@mikro-orm/core@7.2.7", "", { "peerDependencies": { "dataloader": "2.2.3" }, "optionalPeers": ["dataloader"] }, "sha512-46Fd5uhssmi4mkJRsWYhCOX08gseL9zTv9sjELsO1v1zNSeL59Bm4TvKVYHuW9zj+7OiE2o8dw2FSWNBfy0Www=="],
+
+    "@mikro-orm/decorators": ["@mikro-orm/decorators@7.2.7", "", { "peerDependencies": { "@mikro-orm/core": "7.2.7", "reflect-metadata": "^0.1.0 || ^0.2.0" }, "optionalPeers": ["reflect-metadata"] }, "sha512-JUT/+d8EYYyPksNAv8EFonrFAXOa26T93iK4+NttxXQ0xw+iYJsYjcEScSQza6+nYsPnRUv5qVGwI/LdH9Wx+g=="],
 
     "@mikro-orm/migrations": ["@mikro-orm/migrations@7.2.7", "", { "dependencies": { "@mikro-orm/sql": "7.2.7" }, "peerDependencies": { "@mikro-orm/core": "7.2.7" } }, "sha512-FtTWOIaUStEs9o2eAtlOfSjmKW228mES4aZloDzw9a47h1GteNa1YfwglL7G/R0GSAqXuuFAA+RqgMgJ5KHFug=="],
 
