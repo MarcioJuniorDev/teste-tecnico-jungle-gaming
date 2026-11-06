@@ -1,6 +1,6 @@
 import { Module } from '@nestjs/common';
 import { AppController } from './app.controller';
-import { PersistenceModule } from './infra/persistence/mikro-orm.module';
+import { PersistenceModule } from './infra/persistence/persistence.module';
 
 @Module({
   imports: [PersistenceModule],

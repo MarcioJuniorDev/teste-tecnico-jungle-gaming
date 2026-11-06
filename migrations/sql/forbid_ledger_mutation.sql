@@ -1,6 +1,6 @@
--- Aplicado fora das migrations porque o runner do MikroORM v7
+﻿-- Aplicado fora das migrations porque o runner do MikroORM v7
 -- separa statements por ';' e quebra blocos PL/pgSQL delimitados por $$.
--- Rodar após `bun run migration:up`:
+-- Rodar apos 'bun run migration:up':
 --   Get-Content .\migrations\sql\forbid_ledger_mutation.sql | docker compose exec -T postgres psql -U wagering -d wagering
 
 create or replace function forbid_ledger_mutation() returns trigger as $$
