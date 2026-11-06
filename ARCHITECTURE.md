@@ -122,6 +122,15 @@ Não implementada.
 - `toJSON()` serializa `occurredAt` como ISO-8601; `data` carrega `MoneyProps` (string), nunca `Money`.
 - Eventos concretos: `WagerTransactionProcessed`, `WagerTransactionRejected`, `WalletBalanceChanged`, `WagerTransactionPendingReference`.
 
+# Persistência
+- Portas em `src/application/ports/` (interface + `Symbol` token), implementações em `src/infra/persistence/repositories/`.
+- O domínio não conhece MikroORM; os repositórios usam mappers explícitos (`rehydrate` / `.toJSON()`).
+- `UnitOfWork.run(fn)` sobre `em.transactional(fn)`: o use case recebe um `EntityManager` transacional.
+- `WalletRepository.findByIdForUpdate` usa `LockMode.PESSIMISTIC_WRITE` (lock por linha).
+- Fork por request automático (`@mikro-orm/nestjs`); `fork()` explícito só em workers de background (Fase 8).
+- `entities` do runtime aponta para `src/` (Bun transpila TS direto); `dist/` fica para containerização (Fase 10).
+- Tokens `Symbol` porque interfaces somem no runtime; o NestJS precisa de um valor de injeção.
+
 # Schema (banco)
 Garantias aplicadas no schema, não só em código:
 - `wallets`: `UNIQUE (player_id, currency)`, `CHECK (balance_amount >= 0)`, `CHECK (currency = balance_currency)`, `version`.
@@ -135,12 +144,27 @@ Garantias aplicadas no schema, não só em código:
 - `Migration20261106020000_add_invariants`: `CHECK`, FKs, índice único parcial de reversão.
 - O trigger `wallet_ledger_entries_immutable` e a função `forbid_ledger_mutation()` são criados **fora** das migrations (via `psql`), porque o runner do MikroORM v7 separa statements por `;` e quebra blocos PL/pgSQL delimitados por `$$`. O SQL versionado está em `migrations/sql/forbid_ledger_mutation.sql` e deve ser aplicado após `migration:up`.
 - Limitação conhecida; candidata a correção na Fase 4/5 com runner customizado ou `node-pg-migrate`.
+- O SQL versionado está em `migrations/sql/forbid_ledger_mutation.sql` e deve ser aplicado após `migration:up` (comando no README).
 
-# Limitações atuais (pós-Fase 3)
-- Sem camada de repositórios (portas + implementações) — Fase 4.
-- Sem use case `ProcessWagerTransaction` — Fase 5.
-- Sem endpoints HTTP, consumer SQS, outbox publisher, observabilidade — Fases 6–9.
-- Sem testes de integração/concorrência — Fase 10.
-- `entities` do runtime aponta para `./dist/**` (que não existe); só a CLI usa `entitiesTs`. Ajuste na Fase 4/5 (gerar `dist/` ou apontar o runtime para `src/`).
-- Sem `Dockerfile` da app; o Compose sobe só PG e LocalStack.
+# Caso de uso central (ProcessWagerTransaction)
+Uma transação SQL por operação, na ordem:
+1. Inbox (SQS) — `receive` + `markProcessed`; redelivery processada devolve replay.
+2. Idempotência — `findByIdempotencyKey`; hash igual → replay, hash diferente → conflito (`409`).
+3. `PENDING` — persiste antes do lock; `UniqueConstraintViolationException` na corrida relê e classifica.
+4. Lock — `findByIdForUpdate` (pessimista).
+5. `WagerPolicy.evaluate` → `PROCESS` | `REJECT` | `PENDING_REFERENCE`.
+6. Aplicação — ledger + wallet + transação; `LOSS` não move saldo.
+7. Outbox — eventos enfileirados na mesma transação (`WagerTransactionProcessed`, `WagerTransactionRejected`, `WalletBalanceChanged`, `WagerTransactionPendingReference`).
+8. Commit.
+
+Regra: rejeição de negócio **não** derruba a transação (auditável); só erro de infraestrutura faz rollback.
+
+`payloadHash` = SHA-256 do JSON canônico (chaves ordenadas) de `{ providerId, externalTransactionId, playerId, walletId, roundId, gameId, kind, money }`; header/metadados fora.
+
+# Limitações atuais (pós-Fase 5)
+- Sem endpoints HTTP — Fase 6.
+- Sem consumer SQS, outbox publisher, observabilidade — Fases 7–9.
+- Sem testes de concorrência reais (corrida de `UNIQUE`, lock) — Fase 10.
+- O teste de integração de repositórios roda contra o banco de dev; setup dedicado na Fase 10.
+- Sem `Dockerfile` da app.
 - Auth não implementada (decisão registrada acima).
