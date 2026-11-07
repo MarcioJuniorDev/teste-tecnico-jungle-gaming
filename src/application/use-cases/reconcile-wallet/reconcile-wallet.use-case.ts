@@ -1,11 +1,11 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
-import { Money } from '../../../domain/money/money';
 import { WALLET_REPOSITORY } from '../../ports/wallet.repository';
 import type { WalletRepository } from '../../ports/wallet.repository';
 import { LEDGER_REPOSITORY } from '../../ports/ledger.repository';
 import type { LedgerRepository } from '../../ports/ledger.repository';
 import { ReconcileWalletCommand } from './reconcile-wallet.command';
 import { ReconcileWalletResult } from './reconcile-wallet.result';
+import { WalletNotFoundError } from './reconcile-wallet.errors';
 
 @Injectable()
 export class ReconcileWalletUseCase {
@@ -21,7 +21,7 @@ export class ReconcileWalletUseCase {
   ): Promise<ReconcileWalletResult> {
     const wallet = await this.wallets.findById(command.walletId);
     if (!wallet) {
-      throw new Error(`wallet ${command.walletId} not found`);
+      throw new WalletNotFoundError(command.walletId);
     }
 
     const { total, count } = await this.ledger.sumByWallet(
@@ -48,4 +48,4 @@ export class ReconcileWalletUseCase {
       checkedEntries: count,
     };
   }
-}   
+}

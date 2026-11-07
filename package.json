@@ -11,7 +11,8 @@
     "test:concurrency": "bun test test/concurrency",
     "migration:create": "mikro-orm migration:create",
     "migration:up": "mikro-orm migration:up",
-    "migration:down": "mikro-orm migration:down"
+    "migration:down": "mikro-orm migration:down",
+    "consumer": "bun src/consumers/main.ts"
   },
   "dependencies": {
     "@aws-sdk/client-sqs": "^3.1162.0",

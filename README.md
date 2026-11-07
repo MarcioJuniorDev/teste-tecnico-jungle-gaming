@@ -121,6 +121,30 @@ Configuração via env (defaults do LocalStack): `AWS_ENDPOINT_URL`, `AWS_REGION
 | 422 | Rejeição de negócio (`BUSINESS_REJECTION` com `failureCode`) |
 | 503 | `ready` com dependência fora |
 
+## Consumidor SQS
+
+O consumer roda em **processo separado** (`bun run consumer`), consumindo a fila `wager-transactions.fifo`:
+
+- **Long polling** (`waitTimeSeconds: 20`, `maxNumberOfMessages: 10`), processamento paralelo com concorrência 5.
+- **Reuso do `ProcessWagerTransactionUseCase`**, passando `inbox: { consumerName: 'wager-consumer', messageId }`.
+- **Deduplicação por inbox persistente** (`PRIMARY KEY (consumer_name, message_id)`); redelivery de mensagem já processada devolve replay sem novo efeito.
+- **Ack só após o commit**.
+- **Classificação de erros**:
+  - Negócio (`REJECTED`/`PENDING_REFERENCE`) → ack.
+  - Transitório (PG fora, deadlock, timeout, serialização) → não ack + `ChangeMessageVisibility` com backoff exponencial (30s→5min).
+  - Permanente (mensagem malformada, `OPENING`) → não ack; o SQS move para a DLQ após `maxReceiveCount: 5`.
+- **Graceful shutdown** (SIGTERM/SIGINT): para o loop, aguarda até 10s as mensagens em andamento, devolve visibilidade das restantes.
+
+### Enviar mensagem de teste (via `file://`, para preservar as aspas)
+
+O `--message-body` inline no PowerShell remove as aspas do JSON. Grave o corpo num arquivo e use `file://`:
+
+```powershell
+$messageBody = '{"messageId":"msg-1","type":"WagerTransactionRequested","occurredAt":"2026-11-07T00:00:00.000Z","data":{"providerId":"provider-a","externalTransactionId":"ext-1","idempotencyKey":"provider-a:ext-1","playerId":"...","walletId":"...","roundId":"round-1","gameId":"game-1","kind":"BET","money":{"amount":"10.00","currency":"BRL"}}}'
+Set-Content -Path .\msg.json -Value $messageBody -Encoding utf8 -NoNewline
+docker compose cp .\msg.json localstack:/tmp/msg.json
+docker compose exec localstack awslocal sqs send-message --queue-url http://localhost:4566/000000000000/wager-transactions.fifo --message-body file:///tmp/msg.json --message-group-id "<walletId>" --message-deduplication-id "msg-1"
+
 ## Scripts
 
 - `bun run dev` — inicia a aplicação em http://localhost:3000
@@ -132,6 +156,7 @@ Configuração via env (defaults do LocalStack): `AWS_ENDPOINT_URL`, `AWS_REGION
 - `bun run migration:create` — cria migration
 - `bun run migration:up` — aplica migrations
 - `bun run migration:down` — reverte migrations
+- `bun run consumer` — inicia o consumer SQS (processo separado, sem HTTP).
 
 ## Stack
 
@@ -178,19 +203,19 @@ src/
 │   │   ├── inbox.repository.ts
 │   │   ├── outbox.repository.ts
 │   │   ├── ledger.repository.ts
-│   │   └── unit-of-work.ts
+│   │   └── unit-of-work.ts              # TransactionalRepositories + UnitOfWork
 │   └── use-cases/
 │       ├── create-wallet/
 │       ├── process-wager-transaction/
 │       └── reconcile-wallet/
-├── domain/                             # domínio puro (sem Nest/ORM)
-│   ├── money/
-│   ├── ledger/
-│   ├── wallet/
-│   ├── wagering/
-│   │   └── events/
-│   ├── messaging/
-│   └── shared/
+├── consumers/                           # consumidor SQS (processo separado)
+│   ├── main.ts
+│   ├── consumers.module.ts
+│   ├── sqs-consumer.service.ts
+│   ├── sqs-message.ts
+│   ├── error-classifier.ts
+│   └── backoff.ts
+├── domain/                              # domínio puro (sem Nest/ORM)
 ├── infra/
 │   └── persistence/
 │       ├── entities/
@@ -200,14 +225,7 @@ src/
 ├── interfaces/
 │   └── http/
 │       ├── controllers/
-│       │   ├── wallet.controller.ts
-│       │   ├── wager-transaction.controller.ts
-│       │   ├── ledger.controller.ts
-│       │   ├── reconciliation.controller.ts
-│       │   └── health.controller.ts
 │       ├── health/
-│       │   ├── db.health-indicator.ts
-│       │   └── sqs.health-indicator.ts
 │       ├── dtos/
 │       ├── pipes/
 │       ├── filters/

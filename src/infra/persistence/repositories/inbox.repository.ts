@@ -17,12 +17,23 @@ export class MikroOrmInboxRepository implements InboxRepository {
       consumerName,
       messageId,
     });
+    console.log(
+      `[findByConsumerAndMessage] consumer=${consumerName} message=${messageId} found=${entity ? 'yes' : 'no'}`,
+    );
     return entity ? InboxMessageMapper.toDomain(entity) : null;
   }
 
   async save(message: InboxMessage): Promise<void> {
     const entity = InboxMessageMapper.toEntity(message);
-    this.em.persist(entity);
+    const managed = await this.em.findOne(InboxMessageEntity, {
+      consumerName: message.consumerName,
+      messageId: message.messageId,
+    });
+    if (managed) {
+      this.em.assign(managed, entity, { mergeObjectProperties: true });
+    } else {
+      this.em.persist(entity);
+    }
     await this.em.flush();
   }
 }

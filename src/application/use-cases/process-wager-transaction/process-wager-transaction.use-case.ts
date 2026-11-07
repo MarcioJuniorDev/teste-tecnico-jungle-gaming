@@ -1,8 +1,6 @@
 import { Inject, Injectable } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
-import { EntityManager } from '@mikro-orm/postgresql';
 import { UniqueConstraintViolationException } from '@mikro-orm/core';
-
 import { Money } from '../../../domain/money/money';
 import { Wallet } from '../../../domain/wallet/wallet';
 import { WalletLedgerEntry } from '../../../domain/ledger/wallet-ledger-entry';
@@ -19,25 +17,11 @@ import { WagerTransactionProcessed } from '../../../domain/wagering/events/wager
 import { WagerTransactionRejected } from '../../../domain/wagering/events/wager-transaction-rejected';
 import { WagerTransactionPendingReference } from '../../../domain/wagering/events/wager-transaction-pending-reference';
 import { WalletBalanceChanged } from '../../../domain/wagering/events/wallet-balance-changed';
-
-import { WALLET_REPOSITORY } from '../../ports/wallet.repository';
-import type { WalletRepository } from '../../ports/wallet.repository';
-
-import { WAGER_TRANSACTION_REPOSITORY } from '../../ports/wager-transaction.repository';
-import type { WagerTransactionRepository } from '../../ports/wager-transaction.repository';
-
-import { INBOX_REPOSITORY } from '../../ports/inbox.repository';
-import type { InboxRepository } from '../../ports/inbox.repository';
-
-import { OUTBOX_REPOSITORY } from '../../ports/outbox.repository';
-import type { OutboxRepository } from '../../ports/outbox.repository';
-
-import { LEDGER_REPOSITORY } from '../../ports/ledger.repository';
-import type { LedgerRepository } from '../../ports/ledger.repository';
-
 import { UNIT_OF_WORK } from '../../ports/unit-of-work';
-import type { UnitOfWork } from '../../ports/unit-of-work';
-
+import type {
+  TransactionalRepositories,
+  UnitOfWork,
+} from '../../ports/unit-of-work';
 import { ProcessWagerTransactionCommand } from './process-wager-transaction.command';
 import { ProcessWagerTransactionResult } from './process-wager-transaction.result';
 import { IdempotencyConflictError } from './process-wager-transaction.errors';
@@ -45,36 +29,28 @@ import { computePayloadHash } from './payload-hash';
 
 @Injectable()
 export class ProcessWagerTransactionUseCase {
-  constructor(
-    @Inject(UNIT_OF_WORK) private readonly uow: UnitOfWork,
-    @Inject(WALLET_REPOSITORY) private readonly wallets: WalletRepository,
-    @Inject(WAGER_TRANSACTION_REPOSITORY)
-    private readonly transactions: WagerTransactionRepository,
-    @Inject(INBOX_REPOSITORY) private readonly inbox: InboxRepository,
-    @Inject(OUTBOX_REPOSITORY) private readonly outbox: OutboxRepository,
-    @Inject(LEDGER_REPOSITORY) private readonly ledger: LedgerRepository,
-  ) { }
+  constructor(@Inject(UNIT_OF_WORK) private readonly uow: UnitOfWork) {}
 
   async execute(
     command: ProcessWagerTransactionCommand,
   ): Promise<ProcessWagerTransactionResult> {
-    return this.uow.run((em) => this.runWithinTransaction(em, command));
+    return this.uow.run((repos) => this.runWithinTransaction(repos, command));
   }
 
   private async runWithinTransaction(
-    _em: EntityManager,
+    repos: TransactionalRepositories,
     command: ProcessWagerTransactionCommand,
   ): Promise<ProcessWagerTransactionResult> {
     const payloadHash = computePayloadHash(command);
     let inboxMessage: InboxMessage | null = null;
 
     if (command.inbox) {
-      const inboxResult = await this.handleInbox(command, payloadHash);
+      const inboxResult = await this.handleInbox(repos, command, payloadHash);
       if (inboxResult.replay !== null) return inboxResult.replay;
       inboxMessage = inboxResult.created;
     }
 
-    const existing = await this.transactions.findByIdempotencyKey(
+    const existing = await repos.transactions.findByIdempotencyKey(
       command.providerId,
       command.idempotencyKey,
     );
@@ -82,7 +58,7 @@ export class ProcessWagerTransactionUseCase {
       const result = existing.matchesPayload(payloadHash)
         ? this.resultFromTransaction(existing, true)
         : this.throwConflict(command.idempotencyKey);
-      await this.markInboxProcessed(inboxMessage);
+      await this.markInboxProcessed(repos, inboxMessage);
       return result;
     }
 
@@ -102,31 +78,33 @@ export class ProcessWagerTransactionUseCase {
     });
 
     const raceResult = await this.persistTransactionWithRaceHandling(
+      repos,
       tx,
       payloadHash,
       command.idempotencyKey,
     );
     if (raceResult) {
-      await this.markInboxProcessed(inboxMessage);
+      await this.markInboxProcessed(repos, inboxMessage);
       return raceResult;
     }
 
-    const result = await this.processNewTransaction(tx, command);
-    await this.markInboxProcessed(inboxMessage);
+    const result = await this.processNewTransaction(repos, tx, command);
+    await this.markInboxProcessed(repos, inboxMessage);
     return result;
   }
 
   private async persistTransactionWithRaceHandling(
+    repos: TransactionalRepositories,
     tx: WagerTransaction,
     payloadHash: string,
     idempotencyKey: string,
   ): Promise<ProcessWagerTransactionResult | null> {
     try {
-      await this.transactions.save(tx);
+      await repos.transactions.save(tx);
       return null;
     } catch (err) {
       if (!(err instanceof UniqueConstraintViolationException)) throw err;
-      const winner = await this.transactions.findByIdempotencyKey(
+      const winner = await repos.transactions.findByIdempotencyKey(
         tx.providerId,
         idempotencyKey,
       );
@@ -139,34 +117,35 @@ export class ProcessWagerTransactionUseCase {
   }
 
   private async processNewTransaction(
+    repos: TransactionalRepositories,
     tx: WagerTransaction,
     command: ProcessWagerTransactionCommand,
   ): Promise<ProcessWagerTransactionResult> {
-    const wallet = await this.wallets.findByIdForUpdate(command.walletId);
+    const wallet = await repos.wallets.findByIdForUpdate(command.walletId);
     if (!wallet) {
-      return this.reject(tx, FailureCode.WalletNotFound, command);
+      return this.reject(repos, tx, FailureCode.WalletNotFound, command);
     }
 
     const reference = tx.requiresReference()
-      ? await this.transactions.findByProviderAndExternalId(
-        command.providerId,
-        tx.referenceExternalTransactionId!,
-      )
+      ? await repos.transactions.findByProviderAndExternalId(
+          command.providerId,
+          tx.referenceExternalTransactionId!,
+        )
       : null;
 
     const existingReversals = reference
       ? {
-        refund:
-          (await this.transactions.findProcessedReversalFor(
-            reference.id,
-            WagerTransactionKind.Refund,
-          )) !== null,
-        rollback:
-          (await this.transactions.findProcessedReversalFor(
-            reference.id,
-            WagerTransactionKind.Rollback,
-          )) !== null,
-      }
+          refund:
+            (await repos.transactions.findProcessedReversalFor(
+              reference.id,
+              WagerTransactionKind.Refund,
+            )) !== null,
+          rollback:
+            (await repos.transactions.findProcessedReversalFor(
+              reference.id,
+              WagerTransactionKind.Rollback,
+            )) !== null,
+        }
       : { refund: false, rollback: false };
 
     const decision = WagerPolicy.evaluate({
@@ -178,8 +157,9 @@ export class ProcessWagerTransactionUseCase {
 
     if (decision.action === 'PENDING_REFERENCE') {
       tx.markPendingReference();
-      await this.transactions.save(tx);
+      await repos.transactions.save(tx);
       await this.enqueue(
+        repos,
         OutboxMessage.enqueue(
           WagerTransactionPendingReference.from(
             tx,
@@ -191,23 +171,28 @@ export class ProcessWagerTransactionUseCase {
     }
 
     if (decision.action === 'REJECT') {
-      return this.reject(tx, decision.failureCode, command);
+      return this.reject(repos, tx, decision.failureCode, command);
     }
 
-    return this.applyAndPersist(tx, wallet, reference, command);
+    return this.applyAndPersist(repos, tx, wallet, reference, command);
   }
 
   private async handleInbox(
+    repos: TransactionalRepositories,
     command: ProcessWagerTransactionCommand,
     payloadHash: string,
-  ): Promise<{ replay: ProcessWagerTransactionResult | null; created: InboxMessage | null }> {
+  ): Promise<{
+    replay: ProcessWagerTransactionResult | null;
+    created: InboxMessage | null;
+  }> {
     const { consumerName, messageId } = command.inbox!;
-    const existing = await this.inbox.findByConsumerAndMessage(
+    const existing = await repos.inbox.findByConsumerAndMessage(
       consumerName,
       messageId,
     );
+
     if (existing && existing.isProcessed()) {
-      const tx = await this.transactions.findByIdempotencyKey(
+      const tx = await repos.transactions.findByIdempotencyKey(
         command.providerId,
         command.idempotencyKey,
       );
@@ -225,7 +210,6 @@ export class ProcessWagerTransactionUseCase {
       };
     }
     if (existing) {
-      // mensagem já inserida mas não processada (tentativa anterior falhou antes do commit)
       return { replay: null, created: existing };
     }
     const created = InboxMessage.receive({
@@ -233,16 +217,17 @@ export class ProcessWagerTransactionUseCase {
       messageId,
       payloadHash,
     });
-    await this.inbox.save(created);
+    await repos.inbox.save(created);
     return { replay: null, created };
   }
 
   private async markInboxProcessed(
+    repos: TransactionalRepositories,
     inboxMessage: InboxMessage | null,
   ): Promise<void> {
     if (!inboxMessage || inboxMessage.isProcessed()) return;
     inboxMessage.markProcessed(new Date());
-    await this.inbox.save(inboxMessage);
+    await repos.inbox.save(inboxMessage);
   }
 
   private throwConflict(idempotencyKey: string): never {
@@ -250,6 +235,7 @@ export class ProcessWagerTransactionUseCase {
   }
 
   private async applyAndPersist(
+    repos: TransactionalRepositories,
     tx: WagerTransaction,
     wallet: Wallet,
     reference: WagerTransaction | null,
@@ -257,8 +243,9 @@ export class ProcessWagerTransactionUseCase {
   ): Promise<ProcessWagerTransactionResult> {
     if (!tx.affectsBalance()) {
       tx.markProcessed(undefined, new Date());
-      await this.transactions.save(tx);
+      await repos.transactions.save(tx);
       await this.enqueue(
+        repos,
         OutboxMessage.enqueue(
           WagerTransactionProcessed.from(tx, this.context(tx.id, command)),
         ),
@@ -273,10 +260,10 @@ export class ProcessWagerTransactionUseCase {
         ? wallet.credit(tx.id, tx.money, entryId)
         : wallet.debit(tx.id, tx.money, entryId);
 
-    await this.persistLedger(movement.entry);
-    await this.wallets.save(movement.wallet);
+    await this.persistLedger(repos, movement.entry);
+    await repos.wallets.save(movement.wallet);
     tx.markProcessed(reference?.id, new Date());
-    await this.transactions.save(tx);
+    await repos.transactions.save(tx);
 
     const baseCtx = {
       correlationId: command.correlationId,
@@ -284,11 +271,16 @@ export class ProcessWagerTransactionUseCase {
       occurredAt: new Date(),
     };
     await this.enqueue(
+      repos,
       OutboxMessage.enqueue(
-        WagerTransactionProcessed.from(tx, { ...baseCtx, eventId: randomUUID() }),
+        WagerTransactionProcessed.from(tx, {
+          ...baseCtx,
+          eventId: randomUUID(),
+        }),
       ),
     );
     await this.enqueue(
+      repos,
       OutboxMessage.enqueue(
         WalletBalanceChanged.from(movement.wallet, movement.entry, {
           ...baseCtx,
@@ -306,13 +298,15 @@ export class ProcessWagerTransactionUseCase {
   }
 
   private async reject(
+    repos: TransactionalRepositories,
     tx: WagerTransaction,
     code: FailureCode,
     command: ProcessWagerTransactionCommand,
   ): Promise<ProcessWagerTransactionResult> {
     tx.reject(code);
-    await this.transactions.save(tx);
+    await repos.transactions.save(tx);
     await this.enqueue(
+      repos,
       OutboxMessage.enqueue(
         WagerTransactionRejected.from(tx, code, this.context(tx.id, command)),
       ),
@@ -320,12 +314,18 @@ export class ProcessWagerTransactionUseCase {
     return this.resultFromTransaction(tx, false);
   }
 
-  private async persistLedger(entry: WalletLedgerEntry): Promise<void> {
-    await this.ledger.save(entry);
+  private async persistLedger(
+    repos: TransactionalRepositories,
+    entry: WalletLedgerEntry,
+  ): Promise<void> {
+    await repos.ledger.save(entry);
   }
 
-  private async enqueue(message: OutboxMessage): Promise<void> {
-    await this.outbox.save(message);
+  private async enqueue(
+    repos: TransactionalRepositories,
+    message: OutboxMessage,
+  ): Promise<void> {
+    await repos.outbox.save(message);
   }
 
   private context(

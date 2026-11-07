@@ -126,7 +126,8 @@ Não implementada.
 # Persistência
 - Portas em `src/application/ports/` (interface + `Symbol` token), implementações em `src/infra/persistence/repositories/`.
 - O domínio não conhece MikroORM; os repositórios usam mappers explícitos (`rehydrate` / `.toJSON()`).
-- `UnitOfWork.run(fn)` sobre `em.transactional(fn)`: o use case recebe um `EntityManager` transacional.
+- `UnitOfWork.run(fn)` sobre `em.transactional(fn)`: o `fn` recebe `TransactionalRepositories` (os 5 repositórios **com o `tx` transacional**) e o `EntityManager`. Os use cases de escrita (`ProcessWagerTransaction`, `CreateWallet`) usam os repositórios transacionais, **não** os injetados no construtor. Isso garante que `inbox`, `wallet`, `ledger`, `transaction` e `outbox` participem da **mesma transação** (atomicidade da seção 11).
+- O `MikroOrmUnitOfWork.run` cria os repositórios **com o `tx`** dentro de `em.transactional` e os passa para o `fn`. O `ReconcileWalletUseCase` (leitura) continua com os repositórios injetados.
 - `WalletRepository.findByIdForUpdate` usa `LockMode.PESSIMISTIC_WRITE` (lock por linha).
 - Fork por request automático (`@mikro-orm/nestjs`); `fork()` explícito só em workers de background (Fase 8).
 - `entities` do runtime aponta para `src/` (Bun transpila TS direto); `dist/` fica para containerização (Fase 10).
@@ -164,6 +165,21 @@ Não implementada.
 - `SqsHealthIndicator` — `GetQueueAttributes` na fila `wager-transactions.fifo`, timeout 2s (Promise.race). Lê env: `AWS_ENDPOINT_URL`, `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `SQS_QUEUE_URL`; defaults do LocalStack.
 - Os health checks não exigem autenticação (seção 9 do desafio).
 
+# Consumidor SQS
+
+- Processo separado (`src/consumers/main.ts`), sem HTTP. Sobe o `ConsumersModule` (importa `PersistenceModule`) e o `SqsConsumerService`.
+- **Long polling**: `waitTimeSeconds: 20`, `maxNumberOfMessages: 10`, `visibilityTimeout: 30`. Processa em lotes de até 5 em paralelo.
+- **Reuso do `ProcessWagerTransactionUseCase`**: o consumer passa `inbox: { consumerName: 'wager-consumer', messageId }`. O use case deduplica por inbox, processa e enfileira eventos na outbox.
+- **Ack só após o commit**: o consumer só chama `DeleteMessage` depois que o use case retorna (a transação commitou).
+- **Classificação de erros** (`classifyError`):
+  - **Transitório** (`ECONNREFUSED`, `40001` serialization_failure, `40P01` deadlock_detected, timeout, abort) → **não ack** + `ChangeMessageVisibility` com backoff exponencial (30s, 60s, 120s... até 300s).
+  - **Permanente** (mensagem malformada, `OPENING`) → **não ack**; a visibilidade expira e o SQS move para a DLQ após `maxReceiveCount: 5`.
+  - Negócio (`REJECTED`/`PENDING_REFERENCE`) → **ack** (o use case retornou resultado, não lançou).
+- **Graceful shutdown** (`onApplicationShutdown`/SIGTERM/SIGINT): para o loop, aguarda até 10s as mensagens em andamento, devolve visibilidade das restantes.
+- **`MessageSystemAttributeNames: ['ApproximateReceiveCount']`** no `ReceiveMessage` (atributo do sistema, não da fila); usado para o backoff.
+- O corpo da mensagem é JSON com `{ messageId, type, occurredAt, data }`; `type` deve ser `WagerTransactionRequested`; `OPENING` é rejeitado (não pode vir da fila).
+- **Envio de teste** via `file:///tmp/msg.json` (o PowerShell remove aspas do `--message-body` inline; o `awslocal` lê o arquivo e preserva o JSON).
+
 # Schema (banco)
 Garantias aplicadas no schema, não só em código:
 - `wallets`: `UNIQUE (player_id, currency)`, `CHECK (balance_amount >= 0)`, `CHECK (currency = balance_currency)`, `version`.
@@ -196,11 +212,14 @@ Regra: rejeição de negócio **não** derruba a transação (auditável); só e
 
 `payloadHash` = SHA-256 do JSON canônico (chaves ordenadas) de `{ providerId, externalTransactionId, playerId, walletId, roundId, gameId, kind, money }`; header/metadados fora.
 
-# Limitações atuais (pós-Fase 6)
-- Sem consumer SQS, outbox publisher, worker de `PENDING_REFERENCE`, observabilidade: Fases 7–9.
+- O use case recebe `TransactionalRepositories` do `uow.run` (não os repositórios injetados). Todos os `save`/`find` usam o `tx` transacional — `inbox`, `wallet`, `ledger`, `transaction` e `outbox` commitam juntos ou sofrem rollback juntos.
+
+# Limitações atuais (pós-Fase 7)
+- Sem outbox publisher e worker de `PENDING_REFERENCE`: Fase 8.
+- Sem observabilidade (logs JSON estruturados, métricas prom-client): Fase 9.
 - Sem testes de concorrência reais (corrida de `UNIQUE`, lock, 3 instâncias): Fase 10.
 - O teste de integração de repositórios roda contra o banco de dev; setup dedicado (banco limpo + migrations) na Fase 10.
 - `save` dos repositórios faz `findOne` + `assign`/`persist` (um `SELECT` extra por save). Otimização na Fase 10.
-- `findPage` do ledger carrega até `limit + 1` linhas e mapeia para domínio (mapper por linha). Para volumes grandes, otimização na Fase 10.
+- `findPage` do ledger carrega até `limit + 1` linhas e mapeia para domínio (mapper por linha). Otimização na Fase 10.
 - Sem `Dockerfile` da app.
 - Auth não implementada (decisão registrada acima).

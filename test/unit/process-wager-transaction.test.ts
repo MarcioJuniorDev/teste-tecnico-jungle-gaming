@@ -8,11 +8,9 @@ import { WagerTransactionKind } from '../../src/domain/wagering/wager-transactio
 import { WagerTransactionStatus } from '../../src/domain/wagering/wager-transaction-status';
 import { FailureCode } from '../../src/domain/wagering/failure-code';
 import { InboxMessage } from '../../src/domain/messaging/inbox-message';
-import { WalletMapper } from '../../src/infra/persistence/mappers/wallet.mapper';
 
 const brl = (amount: string) => Money.from({ amount, currency: 'BRL' });
 
-// --- mocks das portas (em memória) ---
 function makeFakes() {
   const wallets = new Map<string, Wallet>();
   const txs = new Map<string, WagerTransaction>();
@@ -35,47 +33,64 @@ function makeFakes() {
       return txs.get(id) ?? null;
     },
     async findByProviderAndExternalId(providerId: string, externalId: string) {
-      return [...txs.values()].find(
-        (t) => t.providerId === providerId && t.externalTransactionId === externalId,
-      ) ?? null;
+      return (
+        [...txs.values()].find(
+          (t) =>
+            t.providerId === providerId &&
+            t.externalTransactionId === externalId,
+        ) ?? null
+      );
     },
     async findByIdempotencyKey(providerId: string, key: string) {
-      return [...txs.values()].find(
-        (t) => t.providerId === providerId && t.idempotencyKey === key,
-      ) ?? null;
+      return (
+        [...txs.values()].find(
+          (t) => t.providerId === providerId && t.idempotencyKey === key,
+        ) ?? null
+      );
     },
-    async findProcessedReversalFor(referenceId: string, kind: WagerTransactionKind) {
-      return [...txs.values()].find(
-        (t) =>
-          t.referenceTransactionId === referenceId &&
-          t.kind === kind &&
-          t.status === WagerTransactionStatus.Processed,
-      ) ?? null;
+    async findProcessedReversalFor(
+      referenceId: string,
+      kind: WagerTransactionKind,
+    ) {
+      return (
+        [...txs.values()].find(
+          (t) =>
+            t.referenceTransactionId === referenceId &&
+            t.kind === kind &&
+            t.status === WagerTransactionStatus.Processed,
+        ) ?? null
+      );
     },
     async save(tx: WagerTransaction) {
-      txs.set(tx.id, WagerTransaction.rehydrate({
-        id: tx.id,
-        providerId: tx.providerId,
-        externalTransactionId: tx.externalTransactionId,
-        idempotencyKey: tx.idempotencyKey,
-        payloadHash: tx.payloadHash,
-        walletId: tx.walletId,
-        playerId: tx.playerId,
-        roundId: tx.roundId,
-        gameId: tx.gameId,
-        kind: tx.kind,
-        money: tx.money,
-        referenceExternalTransactionId: tx.referenceExternalTransactionId,
-        createdAt: tx.createdAt,
-        status: tx.status,
-        referenceTransactionId: tx.referenceTransactionId,
-        failureCode: tx.failureCode,
-        processedAt: tx.processedAt,
-      }));
+      txs.set(
+        tx.id,
+        WagerTransaction.rehydrate({
+          id: tx.id,
+          providerId: tx.providerId,
+          externalTransactionId: tx.externalTransactionId,
+          idempotencyKey: tx.idempotencyKey,
+          payloadHash: tx.payloadHash,
+          walletId: tx.walletId,
+          playerId: tx.playerId,
+          roundId: tx.roundId,
+          gameId: tx.gameId,
+          kind: tx.kind,
+          money: tx.money,
+          referenceExternalTransactionId: tx.referenceExternalTransactionId,
+          createdAt: tx.createdAt,
+          status: tx.status,
+          referenceTransactionId: tx.referenceTransactionId,
+          failureCode: tx.failureCode,
+          processedAt: tx.processedAt,
+        }),
+      );
     },
   };
   const inboxRepo = {
-    async findByConsumerAndMessage(consumerName: string, messageId: string) {
+    async findByConsumerAndMessage(
+      consumerName: string,
+      messageId: string,
+    ) {
       return inboxes.get(`${consumerName}|${messageId}`) ?? null;
     },
     async save(msg: InboxMessage) {
@@ -83,19 +98,52 @@ function makeFakes() {
     },
   };
   const outboxRepo = {
-    async findPendingDue() { return []; },
-    async save(msg: any) { outbox.push(msg); },
+    async findPendingDue() {
+      return [];
+    },
+    async save(msg: any) {
+      outbox.push(msg);
+    },
   };
   const ledgerRepo = {
-    async save() { /* no-op */ },
-  };
-  const uow = {
-    async run<T>(fn: (em: any) => Promise<T>): Promise<T> {
-      return fn({} as any);
+    async save() {
+      /* no-op */
+    },
+    async findPage() {
+      return { items: [], nextCursor: null };
+    },
+    async sumByWallet() {
+      return { total: brl('0.00'), count: 0 };
     },
   };
 
-  return { wallets, txs, inboxes, outbox, walletRepo, txRepo, inboxRepo, outboxRepo, ledgerRepo, uow };
+  const repos = {
+    wallets: walletRepo,
+    transactions: txRepo,
+    inbox: inboxRepo,
+    outbox: outboxRepo,
+    ledger: ledgerRepo,
+  };
+
+  const uow = {
+    async run<T>(fn: (r: typeof repos, em: any) => Promise<T>): Promise<T> {
+      return fn(repos, {} as any);
+    },
+  };
+
+  return {
+    wallets,
+    txs,
+    inboxes,
+    outbox,
+    walletRepo,
+    txRepo,
+    inboxRepo,
+    outboxRepo,
+    ledgerRepo,
+    repos,
+    uow,
+  };
 }
 
 const baseCommand = {
@@ -112,20 +160,16 @@ const baseCommand = {
 };
 
 function makeUseCase(f: ReturnType<typeof makeFakes>) {
-  return new ProcessWagerTransactionUseCase(
-    f.uow as any,
-    f.walletRepo as any,
-    f.txRepo as any,
-    f.inboxRepo as any,
-    f.outboxRepo as any,
-    f.ledgerRepo as any,
-  );
+  return new ProcessWagerTransactionUseCase(f.uow as any);
 }
 
 describe('ProcessWagerTransactionUseCase', () => {
   test('BET with sufficient balance is PROCESSED and updates wallet', async () => {
     const f = makeFakes();
-    f.wallets.set('w1', Wallet.open({ id: 'w1', playerId: 'p1', initialBalance: brl('100.00') }));
+    f.wallets.set(
+      'w1',
+      Wallet.open({ id: 'w1', playerId: 'p1', initialBalance: brl('100.00') }),
+    );
     const uc = makeUseCase(f);
 
     const result = await uc.execute({ ...baseCommand });
@@ -138,7 +182,10 @@ describe('ProcessWagerTransactionUseCase', () => {
 
   test('BET with insufficient balance is REJECTED', async () => {
     const f = makeFakes();
-    f.wallets.set('w1', Wallet.open({ id: 'w1', playerId: 'p1', initialBalance: brl('10.00') }));
+    f.wallets.set(
+      'w1',
+      Wallet.open({ id: 'w1', playerId: 'p1', initialBalance: brl('10.00') }),
+    );
     const uc = makeUseCase(f);
 
     const result = await uc.execute({ ...baseCommand });
@@ -149,7 +196,10 @@ describe('ProcessWagerTransactionUseCase', () => {
 
   test('idempotent replay returns the original result', async () => {
     const f = makeFakes();
-    f.wallets.set('w1', Wallet.open({ id: 'w1', playerId: 'p1', initialBalance: brl('100.00') }));
+    f.wallets.set(
+      'w1',
+      Wallet.open({ id: 'w1', playerId: 'p1', initialBalance: brl('100.00') }),
+    );
     const uc = makeUseCase(f);
 
     const first = await uc.execute({ ...baseCommand });
@@ -161,7 +211,10 @@ describe('ProcessWagerTransactionUseCase', () => {
 
   test('same idempotency key with different payload throws conflict', async () => {
     const f = makeFakes();
-    f.wallets.set('w1', Wallet.open({ id: 'w1', playerId: 'p1', initialBalance: brl('100.00') }));
+    f.wallets.set(
+      'w1',
+      Wallet.open({ id: 'w1', playerId: 'p1', initialBalance: brl('100.00') }),
+    );
     const uc = makeUseCase(f);
 
     await uc.execute({ ...baseCommand });
@@ -172,19 +225,31 @@ describe('ProcessWagerTransactionUseCase', () => {
 
   test('LOSS is PROCESSED without moving balance', async () => {
     const f = makeFakes();
-    f.wallets.set('w1', Wallet.open({ id: 'w1', playerId: 'p1', initialBalance: brl('100.00') }));
+    f.wallets.set(
+      'w1',
+      Wallet.open({ id: 'w1', playerId: 'p1', initialBalance: brl('100.00') }),
+    );
     const uc = makeUseCase(f);
 
-    const result = await uc.execute({ ...baseCommand, kind: WagerTransactionKind.Loss });
+    const result = await uc.execute({
+      ...baseCommand,
+      kind: WagerTransactionKind.Loss,
+    });
 
     expect(result.status).toBe(WagerTransactionStatus.Processed);
     expect(result.balance).toBeUndefined();
-    expect(f.wallets.get('w1')!.balance.toJSON()).toEqual({ amount: '100.00', currency: 'BRL' });
+    expect(f.wallets.get('w1')!.balance.toJSON()).toEqual({
+      amount: '100.00',
+      currency: 'BRL',
+    });
   });
 
   test('REFUND without reference is PENDING_REFERENCE', async () => {
     const f = makeFakes();
-    f.wallets.set('w1', Wallet.open({ id: 'w1', playerId: 'p1', initialBalance: brl('100.00') }));
+    f.wallets.set(
+      'w1',
+      Wallet.open({ id: 'w1', playerId: 'p1', initialBalance: brl('100.00') }),
+    );
     const uc = makeUseCase(f);
 
     const result = await uc.execute({
@@ -208,7 +273,10 @@ describe('ProcessWagerTransactionUseCase', () => {
 
   test('inbox replay returns the original result and does not process twice', async () => {
     const f = makeFakes();
-    f.wallets.set('w1', Wallet.open({ id: 'w1', playerId: 'p1', initialBalance: brl('100.00') }));
+    f.wallets.set(
+      'w1',
+      Wallet.open({ id: 'w1', playerId: 'p1', initialBalance: brl('100.00') }),
+    );
     const uc = makeUseCase(f);
     const command = {
       ...baseCommand,
@@ -220,6 +288,9 @@ describe('ProcessWagerTransactionUseCase', () => {
 
     expect(first.status).toBe(WagerTransactionStatus.Processed);
     expect(second.idempotentReplay).toBe(true);
-    expect(f.wallets.get('w1')!.balance.toJSON()).toEqual({ amount: '75.00', currency: 'BRL' });
+    expect(f.wallets.get('w1')!.balance.toJSON()).toEqual({
+      amount: '75.00',
+      currency: 'BRL',
+    });
   });
 });
