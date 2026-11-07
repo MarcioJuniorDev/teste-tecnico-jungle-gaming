@@ -135,6 +135,7 @@ Não implementada.
 - `save` dos repositórios faz `findOne` + `assign`/`persist`: insert se não existe, update se existe. Resolve o `persist` de entidade nova em update (que violava a PK). Custo: um `SELECT` extra por save; otimização na Fase 10.
 - `LedgerRepository` tem `findPage` (cursor por `(createdAt, id)`) e `sumByWallet` (soma de créditos − débitos, usada na reconciliação). O `findPage` usa `QueryBuilder` com `ORDER BY createdAt, id` e `LIMIT limit + 1` para detectar se há próxima página.
 - O cursor do ledger é opaco (base64 de JSON `{ createdAt, id }`); o cliente não interpreta — só devolve no `cursor` da próxima chamada.
+- `OutboxRepository` tem `findPendingDue`, `lockPendingBatch` (com `PESSIMISTIC_WRITE`), `save`, `markPublished(id)` e `scheduleRetry(id, attempts, nextAttemptAt)`. O `markPublished`/`scheduleRetry` são `UPDATE` direto por id — não usam o `save` robusto (que conflita com o `markPublished` do domínio).
 
 # API HTTP
 
@@ -180,6 +181,30 @@ Não implementada.
 - O corpo da mensagem é JSON com `{ messageId, type, occurredAt, data }`; `type` deve ser `WagerTransactionRequested`; `OPENING` é rejeitado (não pode vir da fila).
 - **Envio de teste** via `file:///tmp/msg.json` (o PowerShell remove aspas do `--message-body` inline; o `awslocal` lê o arquivo e preserva o JSON).
 
+# Outbox publisher e worker de PENDING_REFERENCE
+
+Dois workers em processo separado (`src/workers/main.ts`), sem HTTP:
+
+## Outbox publisher
+
+- Loop contínuo: a cada iteração, `lockPendingBatch(20)` (até 20 mensagens pendentes) e publica na fila `wager-events`.
+- `lockPendingBatch` usa `find` com `lockMode: LockMode.PESSIMISTIC_WRITE` (trava as linhas; **sem** `SKIP LOCKED` — um publisher por vez). Para múltiplos publishers concorrentes (Fase 10), trocar por SQL cru com `FOR UPDATE SKIP LOCKED`.
+- Publicação: `SendMessageCommand` na `wager-events` (standard; **sem** `MessageGroupId`/`MessageDeduplicationId`, que só existem em fila FIFO). O `eventId` no envelope é a chave de dedup do consumidor.
+- Sucesso: `markPublished(id)` (`UPDATE outbox_messages SET published_at = ... WHERE id = ...`).
+- Falha: `scheduleRetry(id, attempts, nextAttemptAt)` (`UPDATE` com backoff exponencial: 5s, 10s, 20s... até 5min).
+- Loop com `sleep(2s)` quando o lote está vazio.
+- **Não usa o `save` robusto** (que faz `findOne` + `assign`/`persist`): `markPublished`/`scheduleRetry` são `UPDATE` direto por id, o que evita o conflito com o `markPublished` do domínio (`OutboxMessage.markPublished` lança se já publicado).
+
+## Worker de PENDING_REFERENCE
+
+- Loop a cada 30s: busca transações em `PENDING_REFERENCE` com `next_attempt_at` nulo ou vencido (limite 20).
+- Para cada uma:
+  - Se `attempts > 8` ou `age > 15min` → `REJECTED` com `REFERENCE_NOT_FOUND` + evento `WagerTransactionRejected` na outbox.
+  - Senão → chama o `ProcessWagerTransactionUseCase` com `reprocess: true`.
+- **`reprocess: true`**: o use case **não retorna replay** para uma transação `PENDING_REFERENCE`; ele resolve a referência de novo (via `findByProviderAndExternalId`), aplica a `WagerPolicy`, e decide `PROCESSED`/`REJECTED`/`PENDING_REFERENCE`.
+- **Lacuna conhecida**: o `attempts` e o `nextAttemptAt` **não são incrementados** a cada tentativa (o worker tenta a cada 30s; o TTL de 15min limita). O incremento fica para a Fase 10.
+- Graceful shutdown (SIGTERM/SIGINT): para os loops.
+
 # Schema (banco)
 Garantias aplicadas no schema, não só em código:
 - `wallets`: `UNIQUE (player_id, currency)`, `CHECK (balance_amount >= 0)`, `CHECK (currency = balance_currency)`, `version`.
@@ -214,12 +239,15 @@ Regra: rejeição de negócio **não** derruba a transação (auditável); só e
 
 - O use case recebe `TransactionalRepositories` do `uow.run` (não os repositórios injetados). Todos os `save`/`find` usam o `tx` transacional — `inbox`, `wallet`, `ledger`, `transaction` e `outbox` commitam juntos ou sofrem rollback juntos.
 
-# Limitações atuais (pós-Fase 7)
-- Sem outbox publisher e worker de `PENDING_REFERENCE`: Fase 8.
-- Sem observabilidade (logs JSON estruturados, métricas prom-client): Fase 9.
-- Sem testes de concorrência reais (corrida de `UNIQUE`, lock, 3 instâncias): Fase 10.
+- `reprocess: true` (no command): quando a transação está em `PENDING_REFERENCE`, o use case **não** retorna replay — ele resolve a referência de novo, aplica a `WagerPolicy`, e decide `PROCESSED`/`REJECTED`/`PENDING_REFERENCE`. Usado pelo worker de `PENDING_REFERENCE`.
+
+# Limitações atuais (pós-Fase 8)
+- Sem observabilidade (logs JSON estruturados, métricas prom-client, `/metrics`): Fase 9.
+- Sem testes de concorrência reais (corrida de `UNIQUE`, lock, 3 instâncias, `SKIP LOCKED` com múltiplos publishers): Fase 10.
 - O teste de integração de repositórios roda contra o banco de dev; setup dedicado (banco limpo + migrations) na Fase 10.
 - `save` dos repositórios faz `findOne` + `assign`/`persist` (um `SELECT` extra por save). Otimização na Fase 10.
+- `lockPendingBatch` usa `PESSIMISTIC_WRITE` **sem** `SKIP LOCKED`: um publisher por vez. Múltiplos publishers concorrentes na Fase 10.
+- O worker de `PENDING_REFERENCE` **não incrementa** `attempts`/`nextAttemptAt` a cada tentativa (tenta a cada 30s; TTL de 15min limita). Incremento na Fase 10.
 - `findPage` do ledger carrega até `limit + 1` linhas e mapeia para domínio (mapper por linha). Otimização na Fase 10.
 - Sem `Dockerfile` da app.
 - Auth não implementada (decisão registrada acima).

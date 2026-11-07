@@ -50,14 +50,24 @@ export class ProcessWagerTransactionUseCase {
       inboxMessage = inboxResult.created;
     }
 
-    const existing = await repos.transactions.findByIdempotencyKey(
+        const existing = await repos.transactions.findByIdempotencyKey(
       command.providerId,
       command.idempotencyKey,
     );
     if (existing) {
-      const result = existing.matchesPayload(payloadHash)
-        ? this.resultFromTransaction(existing, true)
-        : this.throwConflict(command.idempotencyKey);
+      if (!existing.matchesPayload(payloadHash)) {
+        throw new IdempotencyConflictError(command.idempotencyKey);
+      }
+      if (
+        command.reprocess &&
+        existing.status === WagerTransactionStatus.PendingReference
+      ) {
+        // reprocessa: resolve a referência de novo e reavalia
+        const result = await this.processNewTransaction(repos, existing, command);
+        await this.markInboxProcessed(repos, inboxMessage);
+        return result;
+      }
+      const result = this.resultFromTransaction(existing, true);
       await this.markInboxProcessed(repos, inboxMessage);
       return result;
     }

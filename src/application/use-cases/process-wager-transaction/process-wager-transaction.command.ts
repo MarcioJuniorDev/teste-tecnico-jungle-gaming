@@ -19,4 +19,5 @@ export interface ProcessWagerTransactionCommand {
   referenceExternalTransactionId?: string;
   inbox?: InboxContext;
   correlationId: string;
+  reprocess?: boolean;
 }

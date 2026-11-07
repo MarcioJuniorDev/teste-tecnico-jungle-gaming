@@ -79,6 +79,10 @@ O `GET /health/ready` verifica:
 
 Configuração via env (defaults do LocalStack): `AWS_ENDPOINT_URL`, `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `SQS_QUEUE_URL`.
 
+### Outbox publisher
+
+O publisher usa `markPublished(id)` e `scheduleRetry(id, attempts, nextAttemptAt)` — `UPDATE` direto por id, sem depender do `save` robusto (que conflitava com o `markPublished` do domínio). O `lockPendingBatch` usa `lockMode: PESSIMISTIC_WRITE` (trava as linhas; um publisher por vez). Múltiplos publishers concorrentes (Fase 10) exigem SQL cru com `FOR UPDATE SKIP LOCKED`.
+
 ## Endpoints
 
 ### Escrita
@@ -145,6 +149,27 @@ Set-Content -Path .\msg.json -Value $messageBody -Encoding utf8 -NoNewline
 docker compose cp .\msg.json localstack:/tmp/msg.json
 docker compose exec localstack awslocal sqs send-message --queue-url http://localhost:4566/000000000000/wager-transactions.fifo --message-body file:///tmp/msg.json --message-group-id "<walletId>" --message-deduplication-id "msg-1"
 
+## Workers
+
+Os workers rodam em **processo separado** (`bun run workers`), sem HTTP:
+
+- **Outbox publisher**: loop contínuo (sleep 2s quando não há mensagens). Seleciona até 20 mensagens pendentes (`published_at IS NULL`, `next_attempt_at <= now()`), publica na fila `wager-events`, e marca `published_at` (ou `next_attempt_at` com backoff em caso de falha). Usa `lockMode: PESSIMISTIC_WRITE` no `lockPendingBatch` (um publisher por vez; múltiplos publishers concorrentes na Fase 10).
+- **Worker de `PENDING_REFERENCE`**: loop a cada 30s. Busca transações em `PENDING_REFERENCE` com `next_attempt_at` vencido (ou nulo), e reprocessa com `reprocess: true` (resolve a referência de novo, aplica a policy). Se `attempts > 8` ou `age > 15min` → `REJECTED` com `REFERENCE_NOT_FOUND` + evento na outbox.
+- **Graceful shutdown** (SIGTERM/SIGINT): para os loops.
+
+### Teste do worker de `PENDING_REFERENCE`
+
+Cenário do desafio (referência entregue fora de ordem):
+
+1. Criar uma wallet (`POST /wallets`).
+2. Submeter um `REFUND` referenciando `ext-99` (que não existe) → `202 PENDING_REFERENCE`.
+3. Criar a `BET` `ext-99` (mesma wallet, mesmo player, mesmo round, mesmo valor) → `201 PROCESSED`.
+4. Aguardar 30s (o worker reprocessa o `REFUND`) → `ext-11` vira `PROCESSED`, saldo volta ao valor anterior.
+
+### Script
+
+- `bun run workers` — inicia o outbox publisher + worker de `PENDING_REFERENCE` (processo separado).
+
 ## Scripts
 
 - `bun run dev` — inicia a aplicação em http://localhost:3000
@@ -157,6 +182,7 @@ docker compose exec localstack awslocal sqs send-message --queue-url http://loca
 - `bun run migration:up` — aplica migrations
 - `bun run migration:down` — reverte migrations
 - `bun run consumer` — inicia o consumer SQS (processo separado, sem HTTP).
+- `bun run workers` — inicia o outbox publisher + worker de `PENDING_REFERENCE`
 
 ## Stack
 
@@ -197,25 +223,30 @@ bun test
 ```
 src/
 ├── application/
-│   ├── ports/                          # interfaces + Symbol tokens
+│   ├── ports/
 │   │   ├── wallet.repository.ts
 │   │   ├── wager-transaction.repository.ts
 │   │   ├── inbox.repository.ts
-│   │   ├── outbox.repository.ts
+│   │   ├── outbox.repository.ts        # findPendingDue, lockPendingBatch, save, markPublished, scheduleRetry
 │   │   ├── ledger.repository.ts
-│   │   └── unit-of-work.ts              # TransactionalRepositories + UnitOfWork
+│   │   └── unit-of-work.ts             # TransactionalRepositories + UnitOfWork
 │   └── use-cases/
 │       ├── create-wallet/
-│       ├── process-wager-transaction/
+│       ├── process-wager-transaction/  # command com reprocess?
 │       └── reconcile-wallet/
-├── consumers/                           # consumidor SQS (processo separado)
+├── consumers/                          # consumidor SQS (processo separado)
 │   ├── main.ts
 │   ├── consumers.module.ts
 │   ├── sqs-consumer.service.ts
 │   ├── sqs-message.ts
 │   ├── error-classifier.ts
 │   └── backoff.ts
-├── domain/                              # domínio puro (sem Nest/ORM)
+├── workers/                            # outbox publisher + worker de PENDING_REFERENCE (processo separado)
+│   ├── main.ts
+│   ├── workers.module.ts
+│   ├── outbox-publisher.service.ts
+│   └── pending-reference.worker.ts
+├── domain/
 ├── infra/
 │   └── persistence/
 │       ├── entities/
