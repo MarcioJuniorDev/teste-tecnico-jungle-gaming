@@ -264,6 +264,21 @@ Testes (**9**):
 - `--scale app=3 --scale consumer=2 --scale workers=1` sobe as instâncias. Health check via `docker exec <container> bun -e "fetch(...)"` (a imagem não tem `wget`/`curl`).
 - O `app` **não** expõe porta (o `--scale` não funciona com portas mapeadas); o acesso externo fica para o nginx (Fase 12).
 
+# Teste de carga
+
+- **Script próprio** (`load/load-test.ts`, Bun + `fetch`), sem k6.
+- **Ambiente**: app local (`bun run start`) + Postgres/LocalStack no Compose. 1 instância da app (o Compose com 3 instâncias não expõe porta; o teste de carga usa `localhost:3000`).
+- **Carga**: `CONCURRENCY` workers (default 50) submetendo `BET` de `1.00` BRL para `PLAYER_POOL` wallets (default 100), por `DURATION_SECONDS` (default 30s).
+- **Métrica**: latência por request (`performance.now()`), throughput, p50/p95/p99, taxa de erro, rejeições de negócio, outbox lag (via `psql`).
+- **Resultados (exemplo — ambiente local)**: ~2.956 requests, 100% sucesso, 0 erros, 0 rejeições, throughput ~98.5 req/s, p50 502ms, p95 778ms, p99 931ms, outbox lag ~4.4s.
+- **Análise**:
+  - O gargalo é o **Postgres** (lock pessimista por wallet; cada `save` faz `findOne` + `assign`/`persist`, um `SELECT` extra).
+  - A latência alta (p50 502ms) é o `PESSIMISTIC_WRITE` + o `SELECT` extra + o `flush` do MikroORM.
+  - O outbox lag (4.4s) é o publisher em processo separado com `sleep(2s)`.
+  - 0 rejeições (saldo suficiente); 0 replays (key única por request).
+- **Limitações**: ambiente local (Windows, Docker Desktop); 1 instância (o teste não mede as 3 instâncias sem nginx).
+- **O que o teste não cobre**: múltiplos publishers concorrentes (`SKIP LOCKED`), falhas de infraestrutura, kill real de worker, carga de leitura (GETs).
+
 # Schema (banco)
 Garantias aplicadas no schema, não só em código:
 - `wallets`: `UNIQUE (player_id, currency)`, `CHECK (balance_amount >= 0)`, `CHECK (currency = balance_currency)`, `version`.
@@ -300,7 +315,7 @@ Regra: rejeição de negócio **não** derruba a transação (auditável); só e
 
 `payloadHash` = SHA-256 do JSON canônico (chaves ordenadas) de `{ providerId, externalTransactionId, playerId, walletId, roundId, gameId, kind, money }`; header/metadados fora.
 
-# Limitações atuais (pós-Fase 10)
+# Limitações atuais
 - **`SKIP LOCKED` com múltiplos publishers**: o `lockPendingBatch` usa `PESSIMISTIC_WRITE` **sem** `SKIP LOCKED` (um publisher por vez; o segundo espera o primeiro commitar). Para múltiplos publishers concorrentes, trocar por SQL cru com `FOR UPDATE SKIP LOCKED`.
 - **Métricas por processo**: as métricas de processamento (consumer/publisher) ficam nos processos deles; o `/metrics` da app mostra as zeradas + padrão. O Prometheus (Fase 12) scrapeia cada processo.
 - **Kill simulado**: o `kill-after-commit` **simula** o kill (via reprocess); não mata o processo. O `restart` **reinicia** os containers (Compose).
@@ -309,3 +324,7 @@ Regra: rejeição de negócio **não** derruba a transação (auditável); só e
 - **`findPage` do ledger**: carrega até `limit + 1` linhas e mapeia uma a uma. Otimização na Fase 12.
 - **Trigger do ledger fora das migrations**: o runner do MikroORM v7 quebra blocos `$$`; o trigger é aplicado via `psql` (SQL versionado em `migrations/sql/forbid_ledger_mutation.sql`). Correção candidata: `node-pg-migrate` ou runner customizado.
 - **Auth não implementada**: `AuthGuard` no-op + `ProviderIdentityPort` (decisão registrada na Fase 0).
+- **Teste de carga**: mede 1 instância (app local); o Compose com 3 instâncias não expõe porta. Para medir as 3 instâncias, adicionar nginx (Fase 12/opcional).
+- **`SKIP LOCKED` com múltiplos publishers**: o `lockPendingBatch` usa `PESSIMISTIC_WRITE` sem `SKIP LOCKED` (um publisher por vez). Otimização opcional.
+- **Otimizações de `save`/`findPage`**: `save` faz `SELECT` extra; `findPage` mapeia uma a uma. Otimização opcional.
+- **`dlq_messages_total` e `lock_conflicts_total`**: as métricas existem, mas não são incrementadas. Otimização opcional.

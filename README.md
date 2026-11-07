@@ -232,6 +232,39 @@ Esperado: `{"status":"ok"}` (as 3 instâncias respondem).
 
 O helper `test/helpers/assert-ledger-consistent.ts` soma o ledger (créditos − débitos) e compara com `wallet.balance`. Usado no fim de cada teste de integração/concorrência.
 
+## Teste de carga
+
+Script próprio (`load/load-test.ts`, Bun + `fetch`), sem k6. Mede a latência, throughput, p50/p95/p99, taxa de erro, rejeições de negócio e outbox lag.
+
+### Metodologia
+
+- **Ambiente**: Docker Compose local (Postgres + LocalStack + app **local**, `bun run start`). O Compose com 3 instâncias não expõe porta; o teste de carga usa a app local (`localhost:3000`).
+- **Carga**: `CONCURRENCY` workers (default 50) submetendo `BET` de `1.00` BRL para `PLAYER_POOL` wallets (default 100), por `DURATION_SECONDS` (default 30s).
+- **Métrica**: latência por request (`performance.now()`), throughput, p50/p95/p99, taxa de erro, rejeições de negócio, outbox lag.
+
+### Como rodar
+
+```powershell
+# terminal 1: app local
+bun run start
+
+# terminal 2: teste de carga
+bun run load
+```
+
+### Resultados (exemplo — ambiente local)
+Métrica	             Valor
+Total de requests  	2.956
+Sucesso (2xx)	      2.956 (100%)
+Erros (0/5xx)	       0
+Rejeições (422)	     0
+Replays	             0 (key única por request)
+Throughput	        98.53 req/s
+p50	                502.42 ms
+p95	                777.65 ms
+p99	                930.56 ms
+Outbox lag	        4.42 s
+
 ## Scripts
 
 - `bun run dev` — inicia a aplicação em http://localhost:3000
@@ -245,6 +278,7 @@ O helper `test/helpers/assert-ledger-consistent.ts` soma o ledger (créditos −
 - `bun run migration:down` — reverte migrations
 - `bun run consumer` — inicia o consumer SQS (processo separado, sem HTTP)
 - `bun run workers` — inicia o outbox publisher + worker de `PENDING_REFERENCE`
+- `bun run load` — teste de carga (50 workers, 30s, 100 players; `load/load-test.ts`)
 
 ## Stack
 
@@ -364,6 +398,9 @@ migrations/
     └── forbid_ledger_mutation.sql
 infra/
 └── localstack-init.sh
+load/
+├── load-test.ts
+└── README.md
 mikro-orm.config.ts
 Dockerfile
 .dockerignore
