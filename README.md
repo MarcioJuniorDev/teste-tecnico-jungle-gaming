@@ -22,8 +22,10 @@ bun add @nestjs/common @nestjs/core @nestjs/platform-express reflect-metadata rx
 bun add @mikro-orm/core @mikro-orm/nestjs @mikro-orm/postgresql @mikro-orm/migrations
 bun add decimal.js @aws-sdk/client-sqs pino nestjs-pino prom-client zod
 bun add -d typescript @types/bun @mikro-orm/cli
-bun add -d @types/express
+bun add -d @types/express@4
 ```
+
+> `@types/express@4` (devDependency) é necessário porque o `DomainExceptionFilter` e o `HealthController` tipam a response com `Response` do Express, e o `@nestjs/platform-express` usa Express 4 (o `@types/express@5` é incompatível).
 
 ## Infraestrutura (Docker)
 
@@ -69,9 +71,17 @@ O `MikroOrmModule.forRoot(config)` inicializa o ORM no boot; o `entities` aponta
 
 O `payloadHash` é SHA-256 do JSON canônico de `{ providerId, externalTransactionId, playerId, walletId, roundId, gameId, kind, money }`.
 
+### Health checks
+
+O `GET /health/ready` verifica:
+- **PG**: `select 1` via `EntityManager`.
+- **SQS**: `GetQueueAttributes` na fila `wager-transactions.fifo` (timeout 2s).
+
+Configuração via env (defaults do LocalStack): `AWS_ENDPOINT_URL`, `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `SQS_QUEUE_URL`.
+
 ## Endpoints
 
-### Escrita (implementados)
+### Escrita
 
 - `POST /wallets` — cria wallet; saldo inicial > 0 gera `OPENING` + ledger `CREDIT` + outbox, na mesma transação. `201` no sucesso, `409` se `(playerId, currency)` já existe.
 - `POST /wagering/transactions` — submete transação de aposta. Header `Idempotency-Key` obrigatório (`422` se ausente). Chama `ProcessWagerTransactionUseCase`.
@@ -82,26 +92,34 @@ O `payloadHash` é SHA-256 do JSON canônico de `{ providerId, externalTransacti
   - `409` conflito de idempotência (mesma key, payload diferente).
   - `400` payload inválido (validação zod).
 
-### Leitura (a implementar — Fase 6b)
+### Leitura
 
-- `GET /wallets/:id`
-- `GET /wallets/:id/ledger?cursor=...&limit=50`
-- `GET /wagering/transactions/:id`
-- `GET /providers/:providerId/wagering/transactions/:externalTransactionId`
-- `POST /wallets/:id/reconciliation`
-- `GET /health/live`, `GET /health/ready`
+- `GET /wallets/:id` — wallet; `404 WALLET_NOT_FOUND` se não existir.
+- `GET /wallets/:id/ledger?cursor=...&limit=50` — lançamentos paginados; cursor opaco (base64 de `{ createdAt, id }`); `limit` default 50, max 100; resposta com `items` e `nextCursor`.
+- `GET /wagering/transactions/:id` — transação; `404 TRANSACTION_NOT_FOUND`.
+- `GET /providers/:providerId/wagering/transactions/:externalTransactionId` — transação por provider + id externo.
+
+### Reconciliação
+
+- `POST /wallets/:id/reconciliation` — soma do ledger vs `wallet.balance`; retorna `{ storedBalance, calculatedBalance, difference, consistent, checkedEntries }`. Divergência → `consistent: false` (log + métrica; não corrige).
+
+### Health
+
+- `GET /health/live` — `200 { status: 'ok' }` (processo vivo).
+- `GET /health/ready` — `200` se PG e SQS respondem; `503` se algum falha, com `{ status, checks: { db, sqs } }`.
 
 ### Mapeamento HTTP
 
 | Código | Situação |
 |---|---|
 | 400 | Payload inválido (`VALIDATION_FAILED`) |
+| 404 | Wallet/transação inexistente (`WALLET_NOT_FOUND`/`TRANSACTION_NOT_FOUND`) |
 | 409 | Conflito de idempotência (`IDEMPOTENCY_CONFLICT`) ou wallet duplicada (`WALLET_ALREADY_EXISTS`) |
 | 201 | Processado, primeira vez |
-| 200 | Replay |
+| 200 | Replay ou leitura |
 | 202 | Pendente (`PENDING_REFERENCE`) |
 | 422 | Rejeição de negócio (`BUSINESS_REJECTION` com `failureCode`) |
-| 503 | Falha transitória (a implementar no health `ready`) |
+| 503 | `ready` com dependência fora |
 
 ## Scripts
 
@@ -145,7 +163,9 @@ Testes unitários de domínio (Money, WalletLedgerEntry, Wallet, WagerTransactio
 bun test
 ```
 
-Esperado: 63 testes (62 unitários + 1 integração), 0 falhas.
+- Esperado: 63 testes (62 unitários + 1 integração), 0 falhas.
+
+- O teste de integração (test/integration/repositories.test.ts) requer o Postgres de pé (docker compose up -d).
 
 ## Estrutura
 
@@ -161,16 +181,8 @@ src/
 │   │   └── unit-of-work.ts
 │   └── use-cases/
 │       ├── create-wallet/
-│       │   ├── create-wallet.command.ts
-│       │   ├── create-wallet.result.ts
-│       │   ├── create-wallet.errors.ts
-│       │   └── create-wallet.use-case.ts
-│       └── process-wager-transaction/
-│           ├── process-wager-transaction.command.ts
-│           ├── process-wager-transaction.result.ts
-│           ├── process-wager-transaction.errors.ts
-│           ├── process-wager-transaction.use-case.ts
-│           └── payload-hash.ts
+│       ├── process-wager-transaction/
+│       └── reconcile-wallet/
 ├── domain/                             # domínio puro (sem Nest/ORM)
 │   ├── money/
 │   ├── ledger/
@@ -189,14 +201,16 @@ src/
 │   └── http/
 │       ├── controllers/
 │       │   ├── wallet.controller.ts
-│       │   └── wager-transaction.controller.ts
+│       │   ├── wager-transaction.controller.ts
+│       │   ├── ledger.controller.ts
+│       │   ├── reconciliation.controller.ts
+│       │   └── health.controller.ts
+│       ├── health/
+│       │   ├── db.health-indicator.ts
+│       │   └── sqs.health-indicator.ts
 │       ├── dtos/
-│       │   ├── create-wallet.dto.ts
-│       │   └── submit-wager-transaction.dto.ts
 │       ├── pipes/
-│       │   └── zod-validation.pipe.ts
 │       ├── filters/
-│       │   └── domain-exception.filter.ts
 │       └── http.module.ts
 ├── app.controller.ts
 ├── app.module.ts
@@ -205,12 +219,7 @@ test/
 ├── unit/
 └── integration/
 migrations/
-├── Migration20261106013011.ts
-├── Migration20261106020000_add_invariants.ts
-└── sql/
-    └── forbid_ledger_mutation.sql
 infra/
-└── localstack-init.sh
 mikro-orm.config.ts
 docker-compose.yml
 package.json

@@ -4,12 +4,13 @@ import {
   ExceptionFilter,
   HttpStatus,
 } from '@nestjs/common';
-import { Response } from 'express';
+import type { Response } from 'express';
 import { DomainError } from '../../../domain/shared/domain-error';
 import { InvalidMoneyError } from '../../../domain/shared/invalid-money-error';
 import { InvalidTransactionStateError } from '../../../domain/shared/invalid-transaction-state-error';
 import { IdempotencyConflictError } from '../../../application/use-cases/process-wager-transaction/process-wager-transaction.errors';
 import { WalletAlreadyExistsError } from '../../../application/use-cases/create-wallet/create-wallet.errors';
+import { WalletNotFoundError } from '../../../application/use-cases/reconcile-wallet/reconcile-wallet.errors';
 
 type Mapped = { status: number; error: string };
 
@@ -19,6 +20,7 @@ type Mapped = { status: number; error: string };
   InvalidTransactionStateError,
   IdempotencyConflictError,
   WalletAlreadyExistsError,
+  WalletNotFoundError,
 )
 export class DomainExceptionFilter implements ExceptionFilter {
   catch(exception: Error, host: ArgumentsHost): void {
@@ -46,6 +48,16 @@ export class DomainExceptionFilter implements ExceptionFilter {
       return;
     }
 
+    if (exception instanceof WalletNotFoundError) {
+      response.status(mapped.status).json({
+        statusCode: mapped.status,
+        error: mapped.error,
+        message: exception.message,
+        walletId: exception.walletId,
+      });
+      return;
+    }
+
     response.status(mapped.status).json({
       statusCode: mapped.status,
       error: mapped.error,
@@ -59,6 +71,9 @@ export class DomainExceptionFilter implements ExceptionFilter {
     }
     if (exception instanceof WalletAlreadyExistsError) {
       return { status: HttpStatus.CONFLICT, error: 'WALLET_ALREADY_EXISTS' };
+    }
+    if (exception instanceof WalletNotFoundError) {
+      return { status: HttpStatus.NOT_FOUND, error: 'WALLET_NOT_FOUND' };
     }
     if (exception instanceof InvalidMoneyError) {
       return { status: HttpStatus.BAD_REQUEST, error: 'INVALID_MONEY' };

@@ -80,6 +80,7 @@ Não implementada.
 - Desenho futuro: Keycloak via OIDC.
 
 # Domínio
+- A reconciliação usa `Money` (não `number`) para somar o ledger; o `difference` é `stored.subtract(calculated)`, e `isZero()` decide `consistent`.
 
 ## Money
 - Imutável, `Decimal` interno, escala fixa 2.
@@ -131,22 +132,37 @@ Não implementada.
 - `entities` do runtime aponta para `src/` (Bun transpila TS direto); `dist/` fica para containerização (Fase 10).
 - Tokens `Symbol` porque interfaces somem no runtime; o NestJS precisa de um valor de injeção.
 - `save` dos repositórios faz `findOne` + `assign`/`persist`: insert se não existe, update se existe. Resolve o `persist` de entidade nova em update (que violava a PK). Custo: um `SELECT` extra por save; otimização na Fase 10.
+- `LedgerRepository` tem `findPage` (cursor por `(createdAt, id)`) e `sumByWallet` (soma de créditos − débitos, usada na reconciliação). O `findPage` usa `QueryBuilder` com `ORDER BY createdAt, id` e `LIMIT limit + 1` para detectar se há próxima página.
+- O cursor do ledger é opaco (base64 de JSON `{ createdAt, id }`); o cliente não interpreta — só devolve no `cursor` da próxima chamada.
 
 # API HTTP
-- Controllers em `src/interfaces/http/controllers/`, finos: validam com zod, chamam o use case, mapeiam o resultado para HTTP.
-- `ZodValidationPipe` valida o body contra o schema; falha → `400` com `VALIDATION_FAILED` e a lista de issues.
+
+- Controllers finos em `src/interfaces/http/controllers/`: validam com zod, chamam o use case (escrita) ou a porta (leitura), mapeiam o resultado para HTTP.
+- `ZodValidationPipe` valida o body; falha → `400 VALIDATION_FAILED` com a lista de issues.
 - `DomainExceptionFilter` (global) mapeia:
-  - `IdempotencyConflictError` → `409` `IDEMPOTENCY_CONFLICT`.
-  - `WalletAlreadyExistsError` → `409` `WALLET_ALREADY_EXISTS`.
-  - `InvalidMoneyError` → `400` `INVALID_MONEY`.
-  - `InvalidTransactionStateError` → `409` `INVALID_TRANSACTION_STATE`.
-  - `DomainError` → `400` `DOMAIN_ERROR`.
-- Rejeição de negócio (`REJECTED`) **não** é exceção: o controller lê `result.status` e devolve `422` com `failureCode`.
+  - `IdempotencyConflictError` → `409 IDEMPOTENCY_CONFLICT`.
+  - `WalletAlreadyExistsError` → `409 WALLET_ALREADY_EXISTS`.
+  - `WalletNotFoundError` → `404 WALLET_NOT_FOUND`.
+  - `InvalidMoneyError` → `400 INVALID_MONEY`.
+  - `InvalidTransactionStateError` → `409 INVALID_TRANSACTION_STATE`.
+  - `DomainError` → `400 DOMAIN_ERROR`.
+- Rejeição de negócio (`REJECTED`) não é exceção: o controller lê `result.status` e devolve `422` com `failureCode`.
 - `PENDING_REFERENCE` → `202`. Processado primeira vez → `201`. Replay → `200`.
-- Header `Idempotency-Key` obrigatório; ausente → `422` `MISSING_IDEMPOTENCY_KEY`.
+- Header `Idempotency-Key` obrigatório; ausente → `422 MISSING_IDEMPOTENCY_KEY`.
 - `POST /wallets` usa `CreateWalletUseCase`: wallet nasce com zero, `OPENING` credita o saldo inicial, ledger `CREDIT` e outbox na mesma transação; duplicado → `409`.
-- Endpoints de leitura (Fase 6b) usam as portas direto no controller, sem use case (leitura sem regra de negócio).
+- Endpoints de leitura usam as portas direto no controller (sem use case): wallet, transações, ledger.
+- **Ledger paginado** (`GET /wallets/:id/ledger`): cursor opaco = base64 de JSON `{ createdAt, id }`; query `(createdAt, id) > (cursorCreatedAt, cursorId)` com `ORDER BY createdAt, id`; `limit` default 50, max 100; resposta com `items` e `nextCursor`.
+- **Reconciliação** (`POST /wallets/:id/reconciliation`): `ReconcileWalletUseCase` soma o ledger (`sumByWallet`) e compara com `wallet.balance`; divergência → `consistent: false` + log (sem corrigir).
+- **Health** (`GET /health/live`, `GET /health/ready`): `live` sempre `200`; `ready` checa PG (`select 1`) e SQS (`GetQueueAttributes` com timeout 2s), `200` se ambos ok, `503` se algum falha.
 - Auth não implementada (decisão da Fase 0); `AuthGuard` no-op + `ProviderIdentityPort` a implementar.
+
+# Health
+
+- `GET /health/live` — processo vivo; sempre `200 { status: 'ok' }`. Não checa dependências.
+- `GET /health/ready` — `200` se PG e SQS respondem; `503` se algum falha.
+- `DbHealthIndicator` — `em.execute('select 1')`.
+- `SqsHealthIndicator` — `GetQueueAttributes` na fila `wager-transactions.fifo`, timeout 2s (Promise.race). Lê env: `AWS_ENDPOINT_URL`, `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `SQS_QUEUE_URL`; defaults do LocalStack.
+- Os health checks não exigem autenticação (seção 9 do desafio).
 
 # Schema (banco)
 Garantias aplicadas no schema, não só em código:
@@ -180,11 +196,11 @@ Regra: rejeição de negócio **não** derruba a transação (auditável); só e
 
 `payloadHash` = SHA-256 do JSON canônico (chaves ordenadas) de `{ providerId, externalTransactionId, playerId, walletId, roundId, gameId, kind, money }`; header/metadados fora.
 
-# Limitações atuais (pós-Fase 6a)
-- Endpoints de leitura (wallet, ledger, transações, reconciliação) e health checks: Fase 6b.
+# Limitações atuais (pós-Fase 6)
 - Sem consumer SQS, outbox publisher, worker de `PENDING_REFERENCE`, observabilidade: Fases 7–9.
 - Sem testes de concorrência reais (corrida de `UNIQUE`, lock, 3 instâncias): Fase 10.
 - O teste de integração de repositórios roda contra o banco de dev; setup dedicado (banco limpo + migrations) na Fase 10.
 - `save` dos repositórios faz `findOne` + `assign`/`persist` (um `SELECT` extra por save). Otimização na Fase 10.
+- `findPage` do ledger carrega até `limit + 1` linhas e mapeia para domínio (mapper por linha). Para volumes grandes, otimização na Fase 10.
 - Sem `Dockerfile` da app.
 - Auth não implementada (decisão registrada acima).
