@@ -23,9 +23,12 @@ bun add @mikro-orm/core @mikro-orm/nestjs @mikro-orm/postgresql @mikro-orm/migra
 bun add decimal.js @aws-sdk/client-sqs pino nestjs-pino prom-client zod
 bun add -d typescript @types/bun @mikro-orm/cli
 bun add -d @types/express@4
+bun add -d pino-pretty
 ```
 
 > `@types/express@4` (devDependency) é necessário porque o `DomainExceptionFilter` e o `HealthController` tipam a response com `Response` do Express, e o `@nestjs/platform-express` usa Express 4 (o `@types/express@5` é incompatível).
+
+> `pino-pretty` (devDependency) formata os logs em dev (o `nestjs-pino` usa o `transport` para pretty; em produção, logs JSON puros).
 
 ## Infraestrutura (Docker)
 
@@ -112,6 +115,10 @@ O publisher usa `markPublished(id)` e `scheduleRetry(id, attempts, nextAttemptAt
 - `GET /health/live` — `200 { status: 'ok' }` (processo vivo).
 - `GET /health/ready` — `200` se PG e SQS respondem; `503` se algum falha, com `{ status, checks: { db, sqs } }`.
 
+### Métricas
+
+- `GET /metrics` — expõe as métricas Prometheus (texto). Não exige autenticação.
+
 ### Mapeamento HTTP
 
 | Código | Situação |
@@ -170,6 +177,25 @@ Cenário do desafio (referência entregue fora de ordem):
 
 - `bun run workers` — inicia o outbox publisher + worker de `PENDING_REFERENCE` (processo separado).
 
+## Observabilidade
+
+- **Logs JSON estruturados** com `nestjs-pino`: cada request tem `correlationId` (do header `X-Correlation-Id` ou `randomUUID()`), e os campos sensíveis são omitidos (`authorization`, `idempotency-key`, `money`, `balance`, `payload`).
+- **`GET /metrics`** (Prometheus, `prom-client`): expõe as métricas do processo da app. As métricas de processamento ficam nos processos do consumer/publisher (o Prometheus scrapeia cada processo).
+- **Métricas** (8):
+  - `wager_transactions_total{status}` — transações por status (`PROCESSED`/`REJECTED`/`PENDING_REFERENCE`/`FAILED`).
+  - `wager_duplicates_total` — duplicatas detectadas (inbox replay).
+  - `wager_idempotency_conflicts_total` — conflitos de idempotência.
+  - `wager_retries_total{source}` — retries (consumer, publisher).
+  - `wager_dlq_messages_total` — mensagens na DLQ.
+  - `wager_lock_conflicts_total` — conflitos de lock.
+  - `wager_outbox_lag_seconds` — idade do evento mais antigo não publicado.
+  - `wager_processing_duration_seconds{operation}` — latência de processamento.
+- **Health checks** (`GET /health/live`, `GET /health/ready`) já existem desde a Fase 6.
+
+### `correlationId`
+
+O header `X-Correlation-Id` (se enviado) é usado como `correlationId`; senão, `randomUUID()`. O `correlationId` aparece nos logs, é devolvido no response header, e é propagado para o use case, eventos e logs do consumer.
+
 ## Scripts
 
 - `bun run dev` — inicia a aplicação em http://localhost:3000
@@ -224,35 +250,18 @@ bun test
 src/
 ├── application/
 │   ├── ports/
-│   │   ├── wallet.repository.ts
-│   │   ├── wager-transaction.repository.ts
-│   │   ├── inbox.repository.ts
-│   │   ├── outbox.repository.ts        # findPendingDue, lockPendingBatch, save, markPublished, scheduleRetry
-│   │   ├── ledger.repository.ts
-│   │   └── unit-of-work.ts             # TransactionalRepositories + UnitOfWork
 │   └── use-cases/
 │       ├── create-wallet/
-│       ├── process-wager-transaction/  # command com reprocess?
+│       ├── process-wager-transaction/
 │       └── reconcile-wallet/
-├── consumers/                          # consumidor SQS (processo separado)
-│   ├── main.ts
-│   ├── consumers.module.ts
-│   ├── sqs-consumer.service.ts
-│   ├── sqs-message.ts
-│   ├── error-classifier.ts
-│   └── backoff.ts
-├── workers/                            # outbox publisher + worker de PENDING_REFERENCE (processo separado)
-│   ├── main.ts
-│   ├── workers.module.ts
-│   ├── outbox-publisher.service.ts
-│   └── pending-reference.worker.ts
-├── domain/
+├── consumers/
+├── workers/
 ├── infra/
+│   ├── observability/                 # MetricsService, MetricsController, ObservabilityModule
+│   │   ├── metrics.service.ts
+│   │   ├── metrics.controller.ts
+│   │   └── observability.module.ts
 │   └── persistence/
-│       ├── entities/
-│       ├── mappers/
-│       ├── repositories/
-│       └── persistence.module.ts
 ├── interfaces/
 │   └── http/
 │       ├── controllers/
@@ -260,6 +269,8 @@ src/
 │       ├── dtos/
 │       ├── pipes/
 │       ├── filters/
+│       ├── middleware/                # CorrelationIdMiddleware
+│       │   └── correlation-id.middleware.ts
 │       └── http.module.ts
 ├── app.controller.ts
 ├── app.module.ts

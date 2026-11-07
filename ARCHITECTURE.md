@@ -157,6 +157,8 @@ Não implementada.
 - **Reconciliação** (`POST /wallets/:id/reconciliation`): `ReconcileWalletUseCase` soma o ledger (`sumByWallet`) e compara com `wallet.balance`; divergência → `consistent: false` + log (sem corrigir).
 - **Health** (`GET /health/live`, `GET /health/ready`): `live` sempre `200`; `ready` checa PG (`select 1`) e SQS (`GetQueueAttributes` com timeout 2s), `200` se ambos ok, `503` se algum falha.
 - Auth não implementada (decisão da Fase 0); `AuthGuard` no-op + `ProviderIdentityPort` a implementar.
+- `GET /metrics` — expõe as métricas Prometheus (texto). Sem autenticação.
+- `X-Correlation-Id` (header, opcional): o middleware lê ou gera `randomUUID()`, guarda no `req` e devolve no response. O `correlationId` aparece nos logs e é propagado para o use case.
 
 # Health
 
@@ -180,10 +182,12 @@ Não implementada.
 - **`MessageSystemAttributeNames: ['ApproximateReceiveCount']`** no `ReceiveMessage` (atributo do sistema, não da fila); usado para o backoff.
 - O corpo da mensagem é JSON com `{ messageId, type, occurredAt, data }`; `type` deve ser `WagerTransactionRequested`; `OPENING` é rejeitado (não pode vir da fila).
 - **Envio de teste** via `file:///tmp/msg.json` (o PowerShell remove aspas do `--message-body` inline; o `awslocal` lê o arquivo e preserva o JSON).
+- Métricas instrumentadas no consumer: `transactionsTotal` (por status), `duplicatesTotal` (inbox replay), `retriesTotal` (transitório), `idempotencyConflictsTotal`, `processingDuration` (latência).
 
 # Outbox publisher e worker de PENDING_REFERENCE
 
 Dois workers em processo separado (`src/workers/main.ts`), sem HTTP:
+- Métricas instrumentadas no publisher: `outboxLagSeconds` (idade do evento mais antigo não publicado), `retriesTotal` (falha na publicação).
 
 ## Outbox publisher
 
@@ -204,6 +208,23 @@ Dois workers em processo separado (`src/workers/main.ts`), sem HTTP:
 - **`reprocess: true`**: o use case **não retorna replay** para uma transação `PENDING_REFERENCE`; ele resolve a referência de novo (via `findByProviderAndExternalId`), aplica a `WagerPolicy`, e decide `PROCESSED`/`REJECTED`/`PENDING_REFERENCE`.
 - **Lacuna conhecida**: o `attempts` e o `nextAttemptAt` **não são incrementados** a cada tentativa (o worker tenta a cada 30s; o TTL de 15min limita). O incremento fica para a Fase 10.
 - Graceful shutdown (SIGTERM/SIGINT): para os loops.
+
+# Observabilidade
+
+- **Logs JSON** (`nestjs-pino`): substitui o `Logger` padrão do NestJS. O `LoggerModule.forRoot` configura:
+  - `genReqId`: lê `X-Correlation-Id` ou `randomUUID()`.
+  - `customProps`: adiciona `correlationId` aos logs.
+  - `redact`: remove `authorization`, `idempotency-key`, `money`, `balance`, `payload` dos logs (sem dados sensíveis/payloads financeiros completos).
+  - `transport`: `pino-pretty` em dev (logs formatados); JSON puro em produção.
+- **`CorrelationIdMiddleware`**: lê `X-Correlation-Id` (ou `randomUUID()`), guarda no `req` e devolve no response header. Aplicado em todas as rotas (`forRoutes('*')`).
+- **`correlationId`** propagado do HTTP/SQS → use case → eventos → logs. No HTTP, o `WagerTransactionController` lê do `req`; no SQS, o `correlationId` é o `messageId`.
+- **Métricas** (`prom-client`, `MetricsService`):
+  - 8 métricas (transações por status, duplicatas, conflitos de idempotência, retries, DLQ, lock conflicts, outbox lag, latência).
+  - `collectDefaultMetrics` (CPU, memória, event loop, heap).
+  - `GET /metrics` (`MetricsController`) expõe o registro. Sem autenticação (convenção Prometheus).
+  - **`ObservabilityModule`** é `@Global` — o `MetricsService` fica disponível em todos os módulos (HTTP, consumer, workers) sem importar o módulo em cada um.
+- **Processos separados**: as métricas de processamento (consumer/publisher) ficam nos **processos deles** (o `MetricsService` é instanciado por processo). O `/metrics` da app mostra as métricas zeradas + as padrão. O Prometheus (Fase 10/12) scrapeia cada processo.
+- **Health checks** (`/health/live`, `/health/ready`) já existiam; o `ready` pinga PG e SQS.
 
 # Schema (banco)
 Garantias aplicadas no schema, não só em código:
@@ -241,13 +262,13 @@ Regra: rejeição de negócio **não** derruba a transação (auditável); só e
 
 - `reprocess: true` (no command): quando a transação está em `PENDING_REFERENCE`, o use case **não** retorna replay — ele resolve a referência de novo, aplica a `WagerPolicy`, e decide `PROCESSED`/`REJECTED`/`PENDING_REFERENCE`. Usado pelo worker de `PENDING_REFERENCE`.
 
-# Limitações atuais (pós-Fase 8)
-- Sem observabilidade (logs JSON estruturados, métricas prom-client, `/metrics`): Fase 9.
+# Limitações atuais (pós-Fase 9)
 - Sem testes de concorrência reais (corrida de `UNIQUE`, lock, 3 instâncias, `SKIP LOCKED` com múltiplos publishers): Fase 10.
 - O teste de integração de repositórios roda contra o banco de dev; setup dedicado (banco limpo + migrations) na Fase 10.
 - `save` dos repositórios faz `findOne` + `assign`/`persist` (um `SELECT` extra por save). Otimização na Fase 10.
 - `lockPendingBatch` usa `PESSIMISTIC_WRITE` **sem** `SKIP LOCKED`: um publisher por vez. Múltiplos publishers concorrentes na Fase 10.
 - O worker de `PENDING_REFERENCE` **não incrementa** `attempts`/`nextAttemptAt` a cada tentativa (tenta a cada 30s; TTL de 15min limita). Incremento na Fase 10.
+- As métricas de processamento (consumer/publisher) ficam nos processos deles; o `/metrics` da app não as vê. O Prometheus (Fase 10/12) scrapeia cada processo.
 - `findPage` do ledger carrega até `limit + 1` linhas e mapeia para domínio (mapper por linha). Otimização na Fase 10.
-- Sem `Dockerfile` da app.
+- Sem `Dockerfile` da app e `--scale app=3`.
 - Auth não implementada (decisão registrada acima).

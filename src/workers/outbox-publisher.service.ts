@@ -1,4 +1,3 @@
-
 import {
   Injectable,
   Logger,
@@ -8,6 +7,7 @@ import {
 import { SQSClient, SendMessageCommand } from '@aws-sdk/client-sqs';
 import { UNIT_OF_WORK } from '../application/ports/unit-of-work';
 import type { UnitOfWork } from '../application/ports/unit-of-work';
+import { MetricsService } from '../infra/observability/metrics.service';
 
 const BATCH_SIZE = 20;
 const SLEEP_MS = 2000;
@@ -20,7 +20,10 @@ export class OutboxPublisherService implements OnApplicationShutdown {
   private running = false;
   private loop: Promise<void> | null = null;
 
-  constructor(@Inject(UNIT_OF_WORK) private readonly uow: UnitOfWork) {
+  constructor(
+    @Inject(UNIT_OF_WORK) private readonly uow: UnitOfWork,
+    @Inject(MetricsService) private readonly metrics: MetricsService,
+  ) {
     this.client = new SQSClient({
       endpoint: process.env.AWS_ENDPOINT_URL ?? 'http://localhost:4566',
       region: process.env.AWS_REGION ?? 'us-east-1',
@@ -68,6 +71,11 @@ export class OutboxPublisherService implements OnApplicationShutdown {
       const batch = await repos.outbox.lockPendingBatch(BATCH_SIZE);
       if (batch.length === 0) return 0;
 
+      const oldest = batch[0];
+      this.metrics.outboxLagSeconds.set(
+        (Date.now() - oldest.occurredAt.getTime()) / 1000,
+      );
+
       for (const message of batch) {
         try {
           await this.client.send(
@@ -81,6 +89,7 @@ export class OutboxPublisherService implements OnApplicationShutdown {
           this.logger.error(
             `publish failed for ${message.id}: ${(err as Error).message}`,
           );
+          this.metrics.retriesTotal.inc({ source: 'publisher' });
           const attempts = message.attempts + 1;
           const backoffMs = Math.min(5000 * Math.pow(2, attempts - 1), 300_000);
           await repos.outbox.scheduleRetry(
