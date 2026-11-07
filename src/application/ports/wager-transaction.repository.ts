@@ -18,4 +18,5 @@ export interface WagerTransactionRepository {
     kind: WagerTransactionKind,
   ): Promise<WagerTransaction | null>;
   save(transaction: WagerTransaction): Promise<void>;
+  incrementAttempts(id: string, nextAttemptAt: Date): Promise<void>;
 }

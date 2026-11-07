@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { MikroORM } from '@mikro-orm/postgresql';
-import config from '../../mikro-orm.config';
+import { setupIntegrationDb, teardownIntegrationDb } from './setup';
 import { Wallet } from '../../src/domain/wallet/wallet';
 import { Money } from '../../src/domain/money/money';
 import { WalletMapper } from '../../src/infra/persistence/mappers/wallet.mapper';
@@ -12,16 +12,11 @@ describe('WalletRepository (integração)', () => {
   let orm: MikroORM;
 
   beforeAll(async () => {
-    orm = await MikroORM.init({
-      ...config,
-      entities: [WalletEntity],
-      entitiesTs: ['./src/infra/persistence/entities/**/*.entity.ts'],
-    });
-    await orm.schema.update();
+    orm = await setupIntegrationDb();
   });
 
   afterAll(async () => {
-    await orm.close(true);
+    await teardownIntegrationDb();
   });
 
   test('salva e busca wallet', async () => {

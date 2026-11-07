@@ -60,4 +60,11 @@ export class MikroOrmWagerTransactionRepository implements WagerTransactionRepos
     }
     await this.em.flush();
   }
+
+   async incrementAttempts(id: string, nextAttemptAt: Date): Promise<void> {
+    await this.em.execute(
+      'update wager_transactions set attempts = attempts + 1, next_attempt_at = ? where id = ?',
+      [nextAttemptAt, id],
+    );
+  }
 }

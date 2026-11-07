@@ -1,0 +1,12 @@
+node_modules
+dist
+test
+.git
+.gitignore
+*.md
+!README.md
+.env
+.env.*
+!.env.example
+migrations
+infra

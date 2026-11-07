@@ -3,6 +3,8 @@
 -- Rodar apos 'bun run migration:up':
 --   Get-Content .\migrations\sql\forbid_ledger_mutation.sql | docker compose exec -T postgres psql -U wagering -d wagering
 
+drop trigger if exists wallet_ledger_entries_immutable on wallet_ledger_entries;
+
 create or replace function forbid_ledger_mutation() returns trigger as $$
 begin
   raise exception 'wallet_ledger_entries is immutable: % not allowed', tg_op;

@@ -7,7 +7,7 @@ MikroORM. Preferido pelo desafio.
 
 ## Separação domínio ↔ ORM
 - Entidades em `src/infra/persistence/entities/`, separadas do domínio puro.
-- Mappers explícitos em `src/infra/persistence/mappers/`, usando `rehydrate` (domínio → ORM) e `.toJSON()` (Money → colunas).
+- Mappers explícitos em `src/infra/persistence/mappers/`, usando `rehydrate` (ORM → domínio) e `.toJSON()` (domínio → colunas).
 - Domínio não importa MikroORM; o ORM não vaza para `src/domain/`.
 
 ## Money
@@ -44,12 +44,13 @@ SHA-256 do JSON canônico (chaves ordenadas).
 | Código | Situação |
 |---|---|
 | 400 | Payload inválido |
-| 409 | Conflito de idempotência |
+| 404 | Wallet/transação inexistente |
+| 409 | Conflito de idempotência ou wallet duplicada |
 | 201 | Processado, primeira vez |
-| 200 | Replay |
+| 200 | Replay ou leitura |
 | 202 | Pendente (`PENDING_REFERENCE`) |
 | 422 | Rejeição de negócio, com `failureCode` |
-| 503 | Falha transitória, com `Retry-After` |
+| 503 | `ready` com dependência fora |
 
 # Taxonomia de failureCode
 | Código | Ação |
@@ -111,7 +112,7 @@ Não implementada.
 - Função pura: `evaluate(input): PolicyDecision` (`PROCESS` | `REJECT` + `failureCode` | `PENDING_REFERENCE`).
 - Sem ORM, sem Nest, sem repositório. Recebe transação, saldo, referência já resolvida e `existingReversals` (booleans).
 - Regras: referência ausente → pendente; mismatch de provider/player/wallet/round → `REFERENCE_MISMATCH`; só moeda → `CURRENCY_MISMATCH`; `REFUND` só de `BET`; `ROLLBACK` de `BET`/`WIN`/`REFUND`; valor diferente → `AMOUNT_MISMATCH`; já revertida → `REFERENCE_ALREADY_REVERSED`; `BET` sem saldo → `INSUFFICIENT_FUNDS`; reversão que negativaria → `REVERSAL_WOULD_OVERDRAW`.
-- A resolução da referência no banco fica no use case (Fase 5).
+- A resolução da referência no banco fica no use case.
 
 ## InboxMessage e OutboxMessage
 - `InboxMessage`: `receive`/`rehydrate`, `isProcessed`, `markProcessed` (lança em dupla marcação). Chave lógica `(consumerName, messageId)`.
@@ -126,19 +127,18 @@ Não implementada.
 # Persistência
 - Portas em `src/application/ports/` (interface + `Symbol` token), implementações em `src/infra/persistence/repositories/`.
 - O domínio não conhece MikroORM; os repositórios usam mappers explícitos (`rehydrate` / `.toJSON()`).
-- `UnitOfWork.run(fn)` sobre `em.transactional(fn)`: o `fn` recebe `TransactionalRepositories` (os 5 repositórios **com o `tx` transacional**) e o `EntityManager`. Os use cases de escrita (`ProcessWagerTransaction`, `CreateWallet`) usam os repositórios transacionais, **não** os injetados no construtor. Isso garante que `inbox`, `wallet`, `ledger`, `transaction` e `outbox` participem da **mesma transação** (atomicidade da seção 11).
+- `UnitOfWork.run(fn)` sobre `em.transactional(fn)`: o `fn` recebe `TransactionalRepositories` (os 5 repositórios **com o `tx` transacional**) e o `EntityManager`. Os use cases de escrita (`ProcessWagerTransaction`, `CreateWallet`) usam os repositórios transacionais, **não** os injetados no construtor. Isso garante que `inbox`, `wallet`, `ledger`, `transaction` e `outbox` participem da **mesma transação**.
 - O `MikroOrmUnitOfWork.run` cria os repositórios **com o `tx`** dentro de `em.transactional` e os passa para o `fn`. O `ReconcileWalletUseCase` (leitura) continua com os repositórios injetados.
 - `WalletRepository.findByIdForUpdate` usa `LockMode.PESSIMISTIC_WRITE` (lock por linha).
-- Fork por request automático (`@mikro-orm/nestjs`); `fork()` explícito só em workers de background (Fase 8).
-- `entities` do runtime aponta para `src/` (Bun transpila TS direto); `dist/` fica para containerização (Fase 10).
+- Fork por request automático (`@mikro-orm/nestjs`); `fork()` explícito só em workers de background.
+- `entities` do runtime aponta para `src/` (Bun transpila TS direto); `dist/` fica para containerização.
 - Tokens `Symbol` porque interfaces somem no runtime; o NestJS precisa de um valor de injeção.
-- `save` dos repositórios faz `findOne` + `assign`/`persist`: insert se não existe, update se existe. Resolve o `persist` de entidade nova em update (que violava a PK). Custo: um `SELECT` extra por save; otimização na Fase 10.
+- `save` dos repositórios faz `findOne` + `assign`/`persist`: insert se não existe, update se existe. Resolve o `persist` de entidade nova em update (que violava a PK). Custo: um `SELECT` extra por save; otimização na Fase 12.
 - `LedgerRepository` tem `findPage` (cursor por `(createdAt, id)`) e `sumByWallet` (soma de créditos − débitos, usada na reconciliação). O `findPage` usa `QueryBuilder` com `ORDER BY createdAt, id` e `LIMIT limit + 1` para detectar se há próxima página.
 - O cursor do ledger é opaco (base64 de JSON `{ createdAt, id }`); o cliente não interpreta — só devolve no `cursor` da próxima chamada.
 - `OutboxRepository` tem `findPendingDue`, `lockPendingBatch` (com `PESSIMISTIC_WRITE`), `save`, `markPublished(id)` e `scheduleRetry(id, attempts, nextAttemptAt)`. O `markPublished`/`scheduleRetry` são `UPDATE` direto por id — não usam o `save` robusto (que conflita com o `markPublished` do domínio).
 
 # API HTTP
-
 - Controllers finos em `src/interfaces/http/controllers/`: validam com zod, chamam o use case (escrita) ou a porta (leitura), mapeiam o resultado para HTTP.
 - `ZodValidationPipe` valida o body; falha → `400 VALIDATION_FAILED` com a lista de issues.
 - `DomainExceptionFilter` (global) mapeia:
@@ -161,15 +161,13 @@ Não implementada.
 - `X-Correlation-Id` (header, opcional): o middleware lê ou gera `randomUUID()`, guarda no `req` e devolve no response. O `correlationId` aparece nos logs e é propagado para o use case.
 
 # Health
-
 - `GET /health/live` — processo vivo; sempre `200 { status: 'ok' }`. Não checa dependências.
 - `GET /health/ready` — `200` se PG e SQS respondem; `503` se algum falha.
 - `DbHealthIndicator` — `em.execute('select 1')`.
 - `SqsHealthIndicator` — `GetQueueAttributes` na fila `wager-transactions.fifo`, timeout 2s (Promise.race). Lê env: `AWS_ENDPOINT_URL`, `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `SQS_QUEUE_URL`; defaults do LocalStack.
-- Os health checks não exigem autenticação (seção 9 do desafio).
+- Os health checks não exigem autenticação.
 
 # Consumidor SQS
-
 - Processo separado (`src/consumers/main.ts`), sem HTTP. Sobe o `ConsumersModule` (importa `PersistenceModule`) e o `SqsConsumerService`.
 - **Long polling**: `waitTimeSeconds: 20`, `maxNumberOfMessages: 10`, `visibilityTimeout: 30`. Processa em lotes de até 5 em paralelo.
 - **Reuso do `ProcessWagerTransactionUseCase`**: o consumer passa `inbox: { consumerName: 'wager-consumer', messageId }`. O use case deduplica por inbox, processa e enfileira eventos na outbox.
@@ -183,16 +181,15 @@ Não implementada.
 - O corpo da mensagem é JSON com `{ messageId, type, occurredAt, data }`; `type` deve ser `WagerTransactionRequested`; `OPENING` é rejeitado (não pode vir da fila).
 - **Envio de teste** via `file:///tmp/msg.json` (o PowerShell remove aspas do `--message-body` inline; o `awslocal` lê o arquivo e preserva o JSON).
 - Métricas instrumentadas no consumer: `transactionsTotal` (por status), `duplicatesTotal` (inbox replay), `retriesTotal` (transitório), `idempotencyConflictsTotal`, `processingDuration` (latência).
+- O `execute` captura `UniqueConstraintViolationException` e retenta em uma nova transação (`handleRaceLoser`). O Postgres aborta a transação no erro (`25P02`); a recuperação **não pode** ser dentro da mesma transação.
 
 # Outbox publisher e worker de PENDING_REFERENCE
-
 Dois workers em processo separado (`src/workers/main.ts`), sem HTTP:
 - Métricas instrumentadas no publisher: `outboxLagSeconds` (idade do evento mais antigo não publicado), `retriesTotal` (falha na publicação).
 
 ## Outbox publisher
-
 - Loop contínuo: a cada iteração, `lockPendingBatch(20)` (até 20 mensagens pendentes) e publica na fila `wager-events`.
-- `lockPendingBatch` usa `find` com `lockMode: LockMode.PESSIMISTIC_WRITE` (trava as linhas; **sem** `SKIP LOCKED` — um publisher por vez). Para múltiplos publishers concorrentes (Fase 10), trocar por SQL cru com `FOR UPDATE SKIP LOCKED`.
+- `lockPendingBatch` usa `find` com `lockMode: LockMode.PESSIMISTIC_WRITE` (trava as linhas; **sem** `SKIP LOCKED` — um publisher por vez). Para múltiplos publishers concorrentes, trocar por SQL cru com `FOR UPDATE SKIP LOCKED` (limitação conhecida).
 - Publicação: `SendMessageCommand` na `wager-events` (standard; **sem** `MessageGroupId`/`MessageDeduplicationId`, que só existem em fila FIFO). O `eventId` no envelope é a chave de dedup do consumidor.
 - Sucesso: `markPublished(id)` (`UPDATE outbox_messages SET published_at = ... WHERE id = ...`).
 - Falha: `scheduleRetry(id, attempts, nextAttemptAt)` (`UPDATE` com backoff exponencial: 5s, 10s, 20s... até 5min).
@@ -200,17 +197,15 @@ Dois workers em processo separado (`src/workers/main.ts`), sem HTTP:
 - **Não usa o `save` robusto** (que faz `findOne` + `assign`/`persist`): `markPublished`/`scheduleRetry` são `UPDATE` direto por id, o que evita o conflito com o `markPublished` do domínio (`OutboxMessage.markPublished` lança se já publicado).
 
 ## Worker de PENDING_REFERENCE
-
 - Loop a cada 30s: busca transações em `PENDING_REFERENCE` com `next_attempt_at` nulo ou vencido (limite 20).
 - Para cada uma:
   - Se `attempts > 8` ou `age > 15min` → `REJECTED` com `REFERENCE_NOT_FOUND` + evento `WagerTransactionRejected` na outbox.
   - Senão → chama o `ProcessWagerTransactionUseCase` com `reprocess: true`.
 - **`reprocess: true`**: o use case **não retorna replay** para uma transação `PENDING_REFERENCE`; ele resolve a referência de novo (via `findByProviderAndExternalId`), aplica a `WagerPolicy`, e decide `PROCESSED`/`REJECTED`/`PENDING_REFERENCE`.
-- **Lacuna conhecida**: o `attempts` e o `nextAttemptAt` **não são incrementados** a cada tentativa (o worker tenta a cada 30s; o TTL de 15min limita). O incremento fica para a Fase 10.
+- O `attempts`/`nextAttemptAt` **são incrementados** via `incrementAttempts(id, nextAttemptAt)` antes do reprocess (corrigido na Fase 10a).
 - Graceful shutdown (SIGTERM/SIGINT): para os loops.
 
 # Observabilidade
-
 - **Logs JSON** (`nestjs-pino`): substitui o `Logger` padrão do NestJS. O `LoggerModule.forRoot` configura:
   - `genReqId`: lê `X-Correlation-Id` ou `randomUUID()`.
   - `customProps`: adiciona `correlationId` aos logs.
@@ -223,8 +218,51 @@ Dois workers em processo separado (`src/workers/main.ts`), sem HTTP:
   - `collectDefaultMetrics` (CPU, memória, event loop, heap).
   - `GET /metrics` (`MetricsController`) expõe o registro. Sem autenticação (convenção Prometheus).
   - **`ObservabilityModule`** é `@Global` — o `MetricsService` fica disponível em todos os módulos (HTTP, consumer, workers) sem importar o módulo em cada um.
-- **Processos separados**: as métricas de processamento (consumer/publisher) ficam nos **processos deles** (o `MetricsService` é instanciado por processo). O `/metrics` da app mostra as métricas zeradas + as padrão. O Prometheus (Fase 10/12) scrapeia cada processo.
+- **Processos separados**: as métricas de processamento (consumer/publisher) ficam nos **processos deles** (o `MetricsService` é instanciado por processo). O `/metrics` da app mostra as métricas zeradas + as padrão. O Prometheus (Fase 12) scrapeia cada processo.
 - **Health checks** (`/health/live`, `/health/ready`) já existiam; o `ready` pinga PG e SQS.
+
+# Testes
+
+## Unitários
+Domínio + use cases (mocks das portas). **63 testes**. Cobrem Money, Wallet, LedgerEntry, WagerTransaction, WagerPolicy, Inbox, Outbox, ProcessWagerTransaction.
+
+## Integração (Postgres real)
+`test/integration/setup.ts`:
+- Banco `wagering_test` (separado do dev; `docker compose exec postgres createdb -U wagering wagering_test`).
+- Migrations via `orm.migrator.up()`.
+- Trigger do ledger via `psql` (idempotente, com `drop trigger if exists`).
+- `teardownIntegrationDb` **não fecha** o `orm` global (evita `driver has already been destroyed` entre arquivos de teste).
+
+Testes (**17**):
+- **constraints**: 11 testes (cada constraint violada por SQL direto: saldo negativo, moeda, `UNIQUE` de wallet, idempotência, kind, `money_amount`, dupla reversão, `UNIQUE` do ledger, aritmética, trigger de UPDATE, trigger de DELETE).
+- **atomicity**: rollback (falha no meio não persiste wallet/outbox); ledger consistente.
+- **inbox**: deduplicação (mesma mensagem duas vezes → 1 inbox).
+- **outbox**: publishers concorrentes com `PESSIMISTIC_WRITE`, `markPublished` por id.
+- **repositories**: `WalletRepository.save`.
+
+## Concorrência (paralelismo real)
+`test/helpers/concurrency-harness.ts` sobe o `AppModule` (sem HTTP) com o `ProcessWagerTransactionUseCase` e o `CreateWalletUseCase` reais.
+
+Testes (**9**):
+- **wallet-concurrency** (`Promise.all` + use case real via `UnitOfWork`):
+  - Saldo 100, duas apostas de 80 simultâneas → 1 `PROCESSED`, 1 `REJECTED` (`INSUFFICIENT_FUNDS`), saldo 20, 1 débito.
+  - Mesma aposta × 50 em paralelo → 1 débito, 49 replays (idempotência).
+- **outbox-concurrency**: 2 publishers com `PESSIMISTIC_WRITE` (serializa; sem `SKIP LOCKED`); `markPublished` idempotente.
+- **pending-reference**: REFUND antes da BET → `PENDING_REFERENCE` → `PROCESSED` (reprocess).
+- **instances**: 3 instâncias da app via Compose (`--scale app=3`), health check; invariante final (`wallet.balance == soma do ledger`).
+- **kill-after-commit**: worker morto após commit, antes do ack → redelivery não duplica (simulado via reprocess).
+- **restart**: reinício do consumer/workers (Compose) mantém a consistência.
+
+**Invariante final:** `assertLedgerConsistent(walletId)` (soma do ledger == `wallet.balance`).
+
+**Correção estrutural (Fase 10c):** o `ProcessWagerTransactionUseCase.execute` captura `UniqueConstraintViolationException` e **retenta em uma nova transação** (`handleRaceLoser`). O Postgres aborta a transação no `UniqueConstraintViolationException` (`25P02`), então a recuperação **não pode** ser dentro da mesma transação. O `persistTransactionWithRaceHandling` é só `save`; a recuperação é no `execute`.
+
+# Containerização
+- `Dockerfile` (bun puro, sem `dist/`): `FROM oven/bun:1.4.4`, `bun install --frozen-lockfile`, `CMD ["bun", "src/main.ts"]`. O `entities` do MikroORM aponta para `src/` (Bun transpila TS).
+- `.dockerignore`: exclui `node_modules`, `dist`, `test`, `migrations`, `infra`, `.env`.
+- `docker-compose.yml`: `app` (sem `ports`; acesso via rede interna), `consumer` (`bun src/consumers/main.ts`), `workers` (`bun src/workers/main.ts`).
+- `--scale app=3 --scale consumer=2 --scale workers=1` sobe as instâncias. Health check via `docker exec <container> bun -e "fetch(...)"` (a imagem não tem `wget`/`curl`).
+- O `app` **não** expõe porta (o `--scale` não funciona com portas mapeadas); o acesso externo fica para o nginx (Fase 12).
 
 # Schema (banco)
 Garantias aplicadas no schema, não só em código:
@@ -237,9 +275,10 @@ Garantias aplicadas no schema, não só em código:
 # Migrations
 - `Migration20261106013011`: schema inicial (tabelas, `UNIQUE`, índice parcial da outbox).
 - `Migration20261106020000_add_invariants`: `CHECK`, FKs, índice único parcial de reversão.
-- O trigger `wallet_ledger_entries_immutable` e a função `forbid_ledger_mutation()` são criados **fora** das migrations (via `psql`), porque o runner do MikroORM v7 separa statements por `;` e quebra blocos PL/pgSQL delimitados por `$$`. O SQL versionado está em `migrations/sql/forbid_ledger_mutation.sql` e deve ser aplicado após `migration:up`.
-- Limitação conhecida; candidata a correção na Fase 4/5 com runner customizado ou `node-pg-migrate`.
+- O trigger `wallet_ledger_entries_immutable` e a função `forbid_ledger_mutation()` são criados **fora** das migrations (via `psql`), porque o runner do MikroORM v7 separa statements por `;` e quebra blocos PL/pgSQL delimitados por `$$`.
 - O SQL versionado está em `migrations/sql/forbid_ledger_mutation.sql` e deve ser aplicado após `migration:up` (comando no README).
+- O SQL é **idempotente** (`drop trigger if exists` + `create or replace function` + `create trigger`), para o setup de integração rodar várias vezes sem falhar.
+- Limitação conhecida; candidata a correção na Fase 12 com runner customizado ou `node-pg-migrate`.
 
 # Caso de uso central (ProcessWagerTransaction)
 Uma transação SQL por operação, na ordem:
@@ -253,22 +292,20 @@ Uma transação SQL por operação, na ordem:
 8. Commit.
 
 - Cada evento da outbox tem `eventId` único (`randomUUID()` por evento); `correlationId`, `causationId` e `occurredAt` são compartilhados. Sem isso, dois eventos no mesmo `ctx` violam a PK da outbox.
+- O use case recebe `TransactionalRepositories` do `uow.run` (não os repositórios injetados). Todos os `save`/`find` usam o `tx` transacional — `inbox`, `wallet`, `ledger`, `transaction` e `outbox` commitam juntos ou sofrem rollback juntos.
+- `reprocess: true` (no command): quando a transação está em `PENDING_REFERENCE`, o use case **não** retorna replay — ele resolve a referência de novo, aplica a `WagerPolicy`, e decide `PROCESSED`/`REJECTED`/`PENDING_REFERENCE`. Usado pelo worker de `PENDING_REFERENCE`.
+- O `execute` captura `UniqueConstraintViolationException` e retenta em uma nova transação (`handleRaceLoser`). O `persistTransactionWithRaceHandling` é só `save`; a recuperação é no `execute`.
 
 Regra: rejeição de negócio **não** derruba a transação (auditável); só erro de infraestrutura faz rollback.
 
 `payloadHash` = SHA-256 do JSON canônico (chaves ordenadas) de `{ providerId, externalTransactionId, playerId, walletId, roundId, gameId, kind, money }`; header/metadados fora.
 
-- O use case recebe `TransactionalRepositories` do `uow.run` (não os repositórios injetados). Todos os `save`/`find` usam o `tx` transacional — `inbox`, `wallet`, `ledger`, `transaction` e `outbox` commitam juntos ou sofrem rollback juntos.
-
-- `reprocess: true` (no command): quando a transação está em `PENDING_REFERENCE`, o use case **não** retorna replay — ele resolve a referência de novo, aplica a `WagerPolicy`, e decide `PROCESSED`/`REJECTED`/`PENDING_REFERENCE`. Usado pelo worker de `PENDING_REFERENCE`.
-
-# Limitações atuais (pós-Fase 9)
-- Sem testes de concorrência reais (corrida de `UNIQUE`, lock, 3 instâncias, `SKIP LOCKED` com múltiplos publishers): Fase 10.
-- O teste de integração de repositórios roda contra o banco de dev; setup dedicado (banco limpo + migrations) na Fase 10.
-- `save` dos repositórios faz `findOne` + `assign`/`persist` (um `SELECT` extra por save). Otimização na Fase 10.
-- `lockPendingBatch` usa `PESSIMISTIC_WRITE` **sem** `SKIP LOCKED`: um publisher por vez. Múltiplos publishers concorrentes na Fase 10.
-- O worker de `PENDING_REFERENCE` **não incrementa** `attempts`/`nextAttemptAt` a cada tentativa (tenta a cada 30s; TTL de 15min limita). Incremento na Fase 10.
-- As métricas de processamento (consumer/publisher) ficam nos processos deles; o `/metrics` da app não as vê. O Prometheus (Fase 10/12) scrapeia cada processo.
-- `findPage` do ledger carrega até `limit + 1` linhas e mapeia para domínio (mapper por linha). Otimização na Fase 10.
-- Sem `Dockerfile` da app e `--scale app=3`.
-- Auth não implementada (decisão registrada acima).
+# Limitações atuais (pós-Fase 10)
+- **`SKIP LOCKED` com múltiplos publishers**: o `lockPendingBatch` usa `PESSIMISTIC_WRITE` **sem** `SKIP LOCKED` (um publisher por vez; o segundo espera o primeiro commitar). Para múltiplos publishers concorrentes, trocar por SQL cru com `FOR UPDATE SKIP LOCKED`.
+- **Métricas por processo**: as métricas de processamento (consumer/publisher) ficam nos processos deles; o `/metrics` da app mostra as zeradas + padrão. O Prometheus (Fase 12) scrapeia cada processo.
+- **Kill simulado**: o `kill-after-commit` **simula** o kill (via reprocess); não mata o processo. O `restart` **reinicia** os containers (Compose).
+- **`dlq_messages_total` e `lock_conflicts_total`**: as métricas existem, mas não são incrementadas (a DLQ e os conflitos de lock não são observados; Fase 12).
+- **`save` com `SELECT` extra**: os repositórios fazem `findOne` + `assign`/`persist` (um `SELECT` por save). Otimização na Fase 12.
+- **`findPage` do ledger**: carrega até `limit + 1` linhas e mapeia uma a uma. Otimização na Fase 12.
+- **Trigger do ledger fora das migrations**: o runner do MikroORM v7 quebra blocos `$$`; o trigger é aplicado via `psql` (SQL versionado em `migrations/sql/forbid_ledger_mutation.sql`). Correção candidata: `node-pg-migrate` ou runner customizado.
+- **Auth não implementada**: `AuthGuard` no-op + `ProviderIdentityPort` (decisão registrada na Fase 0).

@@ -30,7 +30,7 @@ export class PendingReferenceWorker implements OnApplicationShutdown {
     @Inject(UNIT_OF_WORK) private readonly uow: UnitOfWork,
     @Inject(ProcessWagerTransactionUseCase)
     private readonly useCase: ProcessWagerTransactionUseCase,
-  ) {}
+  ) { }
 
   start(): void {
     if (this.running) return;
@@ -92,6 +92,10 @@ export class PendingReferenceWorker implements OnApplicationShutdown {
       await this.expire(tx);
       return;
     }
+
+    await this.uow.run(async (repos) => {
+      await repos.transactions.incrementAttempts(tx.id, new Date(Date.now() + 30_000));
+    });
 
     try {
       const result = await this.useCase.execute({

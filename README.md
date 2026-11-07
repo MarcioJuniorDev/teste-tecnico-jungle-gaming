@@ -41,18 +41,27 @@ docker compose ps
 
 O script `infra/localstack-init.sh` cria as filas `wager-transactions.fifo`, `wager-transactions-dlq.fifo` e `wager-events`, com redrive da fila principal para a DLQ após 5 tentativas.
 
-## Banco de Dados
+## Banco de dados
 
 ### Migrations
-- bun run migration:create   # gera nova migration a partir do diff das entidades
-- bun run migration:up       # aplica migrations pendentes
-- bun run migration:down     # reverte a última migration
 
-A migration inicial (20261106013011) cria as tabelas; a migration 20261106020000_add_invariants adiciona as constraints (CHECK, FOREIGN KEY, índice único parcial de reversão).
+```powershell
+bun run migration:create   # gera nova migration a partir do diff das entidades
+bun run migration:up       # aplica migrations pendentes
+bun run migration:down     # reverte a última migration
+```
 
-#### Trigger de imutabilidade do ledger
-O trigger wallet_ledger_entries_immutable e a função forbid_ledger_mutation() são aplicados fora das migrations, via psql, porque o runner do MikroORM v7 separa statements por ; e quebra blocos PL/pgSQL delimitados por $$. O SQL versionado está em migrations/sql/forbid_ledger_mutation.sql:
-```Get-Content .\migrations\sql\forbid_ledger_mutation.sql | docker compose exec -T postgres psql -U wagering -d wagering```
+A migration inicial (`20261106013011`) cria as tabelas; a migration `20261106020000_add_invariants` adiciona as constraints (`CHECK`, `FOREIGN KEY`, índice único parcial de reversão).
+
+### Trigger de imutabilidade do ledger
+
+O trigger `wallet_ledger_entries_immutable` e a função `forbid_ledger_mutation()` são aplicados **fora** das migrations, via `psql`, porque o runner do MikroORM v7 separa statements por `;` e quebra blocos PL/pgSQL delimitados por `$$`. O SQL versionado está em `migrations/sql/forbid_ledger_mutation.sql`:
+
+```powershell
+Get-Content .\migrations\sql\forbid_ledger_mutation.sql | docker compose exec -T postgres psql -U wagering -d wagering
+```
+
+**Aplicar após `bun run migration:up`.** Limitação conhecida; ver `ARCHITECTURE.md`.
 
 ### Camada de persistência
 
@@ -84,7 +93,7 @@ Configuração via env (defaults do LocalStack): `AWS_ENDPOINT_URL`, `AWS_REGION
 
 ### Outbox publisher
 
-O publisher usa `markPublished(id)` e `scheduleRetry(id, attempts, nextAttemptAt)` — `UPDATE` direto por id, sem depender do `save` robusto (que conflitava com o `markPublished` do domínio). O `lockPendingBatch` usa `lockMode: PESSIMISTIC_WRITE` (trava as linhas; um publisher por vez). Múltiplos publishers concorrentes (Fase 10) exigem SQL cru com `FOR UPDATE SKIP LOCKED`.
+O publisher usa `markPublished(id)` e `scheduleRetry(id, attempts, nextAttemptAt)` — `UPDATE` direto por id, sem depender do `save` robusto (que conflitava com o `markPublished` do domínio). O `lockPendingBatch` usa `lockMode: PESSIMISTIC_WRITE` (trava as linhas; um publisher por vez). Múltiplos publishers concorrentes exigem SQL cru com `FOR UPDATE SKIP LOCKED` (limitação conhecida; Fase 12).
 
 ## Endpoints
 
@@ -155,12 +164,13 @@ $messageBody = '{"messageId":"msg-1","type":"WagerTransactionRequested","occurre
 Set-Content -Path .\msg.json -Value $messageBody -Encoding utf8 -NoNewline
 docker compose cp .\msg.json localstack:/tmp/msg.json
 docker compose exec localstack awslocal sqs send-message --queue-url http://localhost:4566/000000000000/wager-transactions.fifo --message-body file:///tmp/msg.json --message-group-id "<walletId>" --message-deduplication-id "msg-1"
+```
 
 ## Workers
 
 Os workers rodam em **processo separado** (`bun run workers`), sem HTTP:
 
-- **Outbox publisher**: loop contínuo (sleep 2s quando não há mensagens). Seleciona até 20 mensagens pendentes (`published_at IS NULL`, `next_attempt_at <= now()`), publica na fila `wager-events`, e marca `published_at` (ou `next_attempt_at` com backoff em caso de falha). Usa `lockMode: PESSIMISTIC_WRITE` no `lockPendingBatch` (um publisher por vez; múltiplos publishers concorrentes na Fase 10).
+- **Outbox publisher**: loop contínuo (sleep 2s quando não há mensagens). Seleciona até 20 mensagens pendentes (`published_at IS NULL`, `next_attempt_at <= now()`), publica na fila `wager-events`, e marca `published_at` (ou `next_attempt_at` com backoff em caso de falha). Usa `lockMode: PESSIMISTIC_WRITE` no `lockPendingBatch` (um publisher por vez; múltiplos publishers concorrentes na Fase 12).
 - **Worker de `PENDING_REFERENCE`**: loop a cada 30s. Busca transações em `PENDING_REFERENCE` com `next_attempt_at` vencido (ou nulo), e reprocessa com `reprocess: true` (resolve a referência de novo, aplica a policy). Se `attempts > 8` ou `age > 15min` → `REJECTED` com `REFERENCE_NOT_FOUND` + evento na outbox.
 - **Graceful shutdown** (SIGTERM/SIGINT): para os loops.
 
@@ -172,10 +182,6 @@ Cenário do desafio (referência entregue fora de ordem):
 2. Submeter um `REFUND` referenciando `ext-99` (que não existe) → `202 PENDING_REFERENCE`.
 3. Criar a `BET` `ext-99` (mesma wallet, mesmo player, mesmo round, mesmo valor) → `201 PROCESSED`.
 4. Aguardar 30s (o worker reprocessa o `REFUND`) → `ext-11` vira `PROCESSED`, saldo volta ao valor anterior.
-
-### Script
-
-- `bun run workers` — inicia o outbox publisher + worker de `PENDING_REFERENCE` (processo separado).
 
 ## Observabilidade
 
@@ -196,18 +202,48 @@ Cenário do desafio (referência entregue fora de ordem):
 
 O header `X-Correlation-Id` (se enviado) é usado como `correlationId`; senão, `randomUUID()`. O `correlationId` aparece nos logs, é devolvido no response header, e é propagado para o use case, eventos e logs do consumer.
 
+## Docker
+
+### Imagem da app
+
+`Dockerfile` (bun puro, sem `dist/`): `FROM oven/bun:1.4.4`, `bun install --frozen-lockfile`, `CMD ["bun", "src/main.ts"]`. O `.dockerignore` exclui `node_modules`, `dist`, `test`, `migrations`, `infra`, `.env`.
+
+### Compose
+
+O `docker-compose.yml` sobe:
+- `postgres` (5432) e `localstack` (4566).
+- `app` (3 instâncias, sem `ports` — acesso via rede interna).
+- `consumer` (2 instâncias) e `workers` (1 instância).
+
+```powershell
+docker compose up -d --scale app=3 --scale consumer=2 --scale workers=1
+docker compose ps
+```
+
+### Testar as instâncias
+
+```powershell
+docker exec teste-tecnico-jungle-gaming-app-1 bun -e "const r = await fetch('http://localhost:3000/health/live'); console.log(await r.text())"
+```
+
+Esperado: `{"status":"ok"}` (as 3 instâncias respondem).
+
+### `assertLedgerConsistent`
+
+O helper `test/helpers/assert-ledger-consistent.ts` soma o ledger (créditos − débitos) e compara com `wallet.balance`. Usado no fim de cada teste de integração/concorrência.
+
 ## Scripts
 
 - `bun run dev` — inicia a aplicação em http://localhost:3000
 - `bun run start` — inicia a aplicação (modo produção)
 - `bun run typecheck` — verifica erros de tipagem sem executar
-- `bun run test` — testes unitários
-- `bun run test:integration` — testes de integração
-- `bun run test:concurrency` — testes de concorrência
+- `bun run test` — todos os testes (unitários + integração + concorrência)
+- `bun run test:integration` — testes de integração (Postgres real, `wagering_test`)
+- `bun run test:concurrency` — testes de concorrência (paralelismo real, 3 instâncias, kill/restart)
 - `bun run migration:create` — cria migration
 - `bun run migration:up` — aplica migrations
 - `bun run migration:down` — reverte migrations
-- `bun run consumer` — inicia o consumer SQS (processo separado, sem HTTP).
+- `bun run consumer` — inicia o consumer SQS (processo separado, sem HTTP)
 - `bun run workers` — inicia o outbox publisher + worker de `PENDING_REFERENCE`
 
 ## Stack
@@ -234,19 +270,49 @@ ORM para PostgreSQL, com suporte a migrations.
 
 ## Testes
 
-Testes unitários de domínio (Money, WalletLedgerEntry, Wallet, WagerTransaction, InboxMessage, OutboxMessage, WagerPolicy) em `test/unit/`:
+### Unitários
+
+```powershell
+bun test test/unit
+```
+
+Esperado: **63 testes** (domínio + use cases), 0 falhas.
+
+### Integração (Postgres real)
+
+Requer o Postgres de pé (`docker compose up -d`) e o banco `wagering_test`:
+
+```powershell
+docker compose exec postgres createdb -U wagering wagering_test
+bun run test:integration
+```
+
+Esperado: **17 testes** (constraints, atomicidade, inbox, outbox, repositório), 0 falhas.
+
+O setup (`test/integration/setup.ts`) roda as migrations no `wagering_test` e aplica o trigger do ledger (idempotente, com `drop trigger if exists`).
+
+### Concorrência (paralelismo real)
+
+Requer o Compose de pé (3 instâncias da app, 2 consumers, 1 workers):
+
+```powershell
+docker compose up -d --scale app=3 --scale consumer=2 --scale workers=1
+bun run test:concurrency
+```
+
+Esperado: **9 testes** (wallet, outbox, pending-reference, 3 instâncias, kill/restart), 0 falhas.
+
+### Todos
 
 ```powershell
 bun test
 ```
 
-- Esperado: 63 testes (62 unitários + 1 integração), 0 falhas.
-
-- O teste de integração (test/integration/repositories.test.ts) requer o Postgres de pé (docker compose up -d).
+Esperado: **~89 testes** (63 unitários + 17 integração + 9 concorrência), 0 falhas.
 
 ## Estrutura
 
-```
+```text
 src/
 ├── application/
 │   ├── ports/
@@ -257,10 +323,7 @@ src/
 ├── consumers/
 ├── workers/
 ├── infra/
-│   ├── observability/                 # MetricsService, MetricsController, ObservabilityModule
-│   │   ├── metrics.service.ts
-│   │   ├── metrics.controller.ts
-│   │   └── observability.module.ts
+│   ├── observability/
 │   └── persistence/
 ├── interfaces/
 │   └── http/
@@ -269,18 +332,41 @@ src/
 │       ├── dtos/
 │       ├── pipes/
 │       ├── filters/
-│       ├── middleware/                # CorrelationIdMiddleware
-│       │   └── correlation-id.middleware.ts
+│       ├── middleware/
 │       └── http.module.ts
 ├── app.controller.ts
 ├── app.module.ts
 └── main.ts
 test/
+├── helpers/
+│   ├── assert-ledger-consistent.ts
+│   ├── concurrency-harness.ts
+│   └── integration-harness.ts
 ├── unit/
-└── integration/
+├── integration/
+│   ├── setup.ts
+│   ├── repositories.test.ts
+│   ├── constraints.test.ts
+│   ├── atomicity.test.ts
+│   ├── inbox.test.ts
+│   └── outbox.test.ts
+└── concurrency/
+    ├── wallet-concurrency.test.ts
+    ├── outbox-concurrency.test.ts
+    ├── pending-reference.test.ts
+    ├── instances.test.ts
+    ├── kill-after-commit.test.ts
+    └── restart.test.ts
 migrations/
+├── Migration20261106013011.ts
+├── Migration20261106020000_add_invariants.ts
+└── sql/
+    └── forbid_ledger_mutation.sql
 infra/
+└── localstack-init.sh
 mikro-orm.config.ts
+Dockerfile
+.dockerignore
 docker-compose.yml
 package.json
 tsconfig.json
@@ -290,4 +376,4 @@ ARCHITECTURE.md
 
 ## Documentação adicional
 
-- `ARCHITECTURE.md` — decisões arquiteturais
+- `ARCHITECTURE.md` — decisões arquiteturais, testes de concorrência, containerização, limitações conhecidas.

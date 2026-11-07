@@ -29,12 +29,37 @@ import { computePayloadHash } from './payload-hash';
 
 @Injectable()
 export class ProcessWagerTransactionUseCase {
-  constructor(@Inject(UNIT_OF_WORK) private readonly uow: UnitOfWork) {}
+  constructor(@Inject(UNIT_OF_WORK) private readonly uow: UnitOfWork) { }
 
   async execute(
     command: ProcessWagerTransactionCommand,
   ): Promise<ProcessWagerTransactionResult> {
-    return this.uow.run((repos) => this.runWithinTransaction(repos, command));
+    try {
+      return await this.uow.run((repos) =>
+        this.runWithinTransaction(repos, command),
+      );
+    } catch (err) {
+      if (err instanceof UniqueConstraintViolationException) {
+        return this.uow.run((repos) => this.handleRaceLoser(repos, command));
+      }
+      throw err;
+    }
+  }
+
+  private async handleRaceLoser(
+    repos: TransactionalRepositories,
+    command: ProcessWagerTransactionCommand,
+  ): Promise<ProcessWagerTransactionResult> {
+    const payloadHash = computePayloadHash(command);
+    const winner = await repos.transactions.findByIdempotencyKey(
+      command.providerId,
+      command.idempotencyKey,
+    );
+    if (!winner) throw new Error('race loser: winner not found');
+    if (winner.matchesPayload(payloadHash)) {
+      return this.resultFromTransaction(winner, true);
+    }
+    throw new IdempotencyConflictError(command.idempotencyKey);
   }
 
   private async runWithinTransaction(
@@ -50,7 +75,7 @@ export class ProcessWagerTransactionUseCase {
       inboxMessage = inboxResult.created;
     }
 
-        const existing = await repos.transactions.findByIdempotencyKey(
+    const existing = await repos.transactions.findByIdempotencyKey(
       command.providerId,
       command.idempotencyKey,
     );
@@ -87,16 +112,7 @@ export class ProcessWagerTransactionUseCase {
       referenceExternalTransactionId: command.referenceExternalTransactionId,
     });
 
-    const raceResult = await this.persistTransactionWithRaceHandling(
-      repos,
-      tx,
-      payloadHash,
-      command.idempotencyKey,
-    );
-    if (raceResult) {
-      await this.markInboxProcessed(repos, inboxMessage);
-      return raceResult;
-    }
+    await this.persistTransactionWithRaceHandling(repos, tx);
 
     const result = await this.processNewTransaction(repos, tx, command);
     await this.markInboxProcessed(repos, inboxMessage);
@@ -106,24 +122,8 @@ export class ProcessWagerTransactionUseCase {
   private async persistTransactionWithRaceHandling(
     repos: TransactionalRepositories,
     tx: WagerTransaction,
-    payloadHash: string,
-    idempotencyKey: string,
-  ): Promise<ProcessWagerTransactionResult | null> {
-    try {
-      await repos.transactions.save(tx);
-      return null;
-    } catch (err) {
-      if (!(err instanceof UniqueConstraintViolationException)) throw err;
-      const winner = await repos.transactions.findByIdempotencyKey(
-        tx.providerId,
-        idempotencyKey,
-      );
-      if (!winner) throw err;
-      if (winner.matchesPayload(payloadHash)) {
-        return this.resultFromTransaction(winner, true);
-      }
-      throw new IdempotencyConflictError(idempotencyKey);
-    }
+  ): Promise<void> {
+    await repos.transactions.save(tx);
   }
 
   private async processNewTransaction(
@@ -138,24 +138,24 @@ export class ProcessWagerTransactionUseCase {
 
     const reference = tx.requiresReference()
       ? await repos.transactions.findByProviderAndExternalId(
-          command.providerId,
-          tx.referenceExternalTransactionId!,
-        )
+        command.providerId,
+        tx.referenceExternalTransactionId!,
+      )
       : null;
 
     const existingReversals = reference
       ? {
-          refund:
-            (await repos.transactions.findProcessedReversalFor(
-              reference.id,
-              WagerTransactionKind.Refund,
-            )) !== null,
-          rollback:
-            (await repos.transactions.findProcessedReversalFor(
-              reference.id,
-              WagerTransactionKind.Rollback,
-            )) !== null,
-        }
+        refund:
+          (await repos.transactions.findProcessedReversalFor(
+            reference.id,
+            WagerTransactionKind.Refund,
+          )) !== null,
+        rollback:
+          (await repos.transactions.findProcessedReversalFor(
+            reference.id,
+            WagerTransactionKind.Rollback,
+          )) !== null,
+      }
       : { refund: false, rollback: false };
 
     const decision = WagerPolicy.evaluate({
